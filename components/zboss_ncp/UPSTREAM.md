@@ -18,6 +18,11 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
   app-task event (`EVENT_LINK_RESET`, tagged with a generation): the link
   state is reset, the route moves, and frames stamped for the previous host
   are dropped. Sends are bounded at 8 s per frame in 0.5 s slices.
+- **Host bytes in chunks of at most `BUF_SIZE`** (`transport::rx_pump`),
+  which is `protocol::RX_BUFFER_SIZE`. A promotion pumps a read plus the
+  scanned header tail, and a larger chunk overflows `protocol::on_rx`. A
+  chunk whose bytes or event cannot be queued within a second ends the host
+  link, since the stream would be shifted from there on.
 - **NCP-to-host frames in a message buffer**, not a stream buffer, and each
   `EVENT_INPUT` drains all of them. A frame whose event was dropped on a full
   queue then goes out with the next drain instead of shifting every frame

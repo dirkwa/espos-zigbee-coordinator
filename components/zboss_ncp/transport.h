@@ -84,7 +84,8 @@ private:
 	void close_client_int();
 	void on_link_reset_int(uint16_t gen);
 	void poll_boot_ready_int(void* buffer, size_t size);
-	void rx_pump(const uint8_t* data, int readed);
+	// False when host bytes were lost: the link must end.
+	bool rx_pump(const uint8_t* data, int readed);
 
 	static void task(void *pvParameter) {
 		static_cast<transport*>(pvParameter)->task_int();

@@ -82,7 +82,10 @@ esp_err_t transport::write_int(const void *buffer, size_t size)
     return send_all(fd, buffer, size) ? ESP_OK : ESP_FAIL;
 }
 
-void transport::rx_pump(const uint8_t* data, int readed) {
+// A full second of a full queue means the app task is stuck.
+static constexpr int64_t EVENT_POST_DEADLINE_US = 1000LL * 1000;
+
+bool transport::rx_pump(const uint8_t* data, int readed) {
     app::ctx_t ncp_event = {
         .event = app::EVENT_OUTPUT,
         .size = 0
@@ -106,7 +109,7 @@ void transport::rx_pump(const uint8_t* data, int readed) {
                                         pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS));
         if (sent == 0) {
             ESP_LOGE(TAG, "output_buf full, dropping %d bytes", readed - off);
-            break;
+            return false;
         }
         ncp_event.size = sent;
         // Bounded wait on a momentarily-full event queue: the bytes are
@@ -115,11 +118,16 @@ void transport::rx_pump(const uint8_t* data, int readed) {
         // rx_pump only ever runs on the server task, never on the ZBOSS task
         // (app::send_event itself must stay non-blocking for that caller —
         // see the critical-section panic note there).
-        if (app::post_event(ncp_event, pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS)) != ESP_OK) {
-            ESP_LOGE(TAG, "event queue full, %u host bytes orphaned", unsigned(sent));
+        const int64_t deadline = esp_timer_get_time() + EVENT_POST_DEADLINE_US;
+        while (app::post_event(ncp_event, pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS)) != ESP_OK) {
+            if (esp_timer_get_time() >= deadline) {
+                ESP_LOGE(TAG, "event queue full, %u host bytes orphaned", unsigned(sent));
+                return false;
+            }
         }
         off += sent;
     }
+    return true;
 }
 
 void transport::close_client_int() {
@@ -355,8 +363,12 @@ void transport::task_int() {
 
         if (host >= 0 && FD_ISSET(host, &rfds)) {
             int n = recv_now(host, m_temp_buf, BUF_SIZE);
-            if (n > 0) {
-                rx_pump(m_temp_buf, n);
+            // A host whose bytes were lost mid-stream cannot carry on: end
+            // it, and it reconnects to fresh boot frames.
+            if (n > 0 && !rx_pump(m_temp_buf, n)) {
+                ESP_LOGW(TAG, "host bytes lost, closing the host link");
+                drop_fd(host);
+                host = -1;
             } else if (n < 0) {
                 ESP_LOGW(TAG, "host disconnected");
                 drop_fd(host);
@@ -395,7 +407,11 @@ void transport::task_int() {
                         // Posted before the bytes below, so the reset runs
                         // ahead of the new host's first request.
                         promote(host);
-                        rx_pump(m_scan_buf + at, len - at);
+                        if (!rx_pump(m_scan_buf + at, len - at)) {
+                            ESP_LOGW(TAG, "host bytes lost, closing the host link");
+                            drop_fd(host);
+                            host = -1;
+                        }
                         continue;
                     }
                 }
