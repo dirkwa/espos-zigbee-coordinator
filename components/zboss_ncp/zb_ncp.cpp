@@ -907,6 +907,7 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
         // false to ZBOSS) so its normal error path runs.
         return false;
     }
+    protocol::reply_scope scope(req.epoch);
 
     // Number of bytes we can actually read for the simple_desc body. Trust the
     // smaller of (frame remainder) and (declared length) — the whole point of

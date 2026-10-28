@@ -115,7 +115,11 @@ esp_err_t protocol::send_data_int(const void* data,size_t size) {
 	}
 
 	utils::sem_lock l(m_tx_sem);
-	
+	if (t_reply_epoch != 0 && t_reply_epoch != m_epoch.load(std::memory_order_relaxed)) {
+		ESP_LOGW(TAG,"reply for a previous host dropped");
+		return ESP_OK;
+	}
+
 	auto hdr = reinterpret_cast<ncp_header_t*>(m_tx_buffer);
 	hdr->signature[0] = 0xde;
 	hdr->signature[1] = 0xad;
@@ -266,6 +270,8 @@ esp_err_t protocol::on_rx_int(const void* data,size_t size) {
 
 
 
+thread_local uint32_t protocol::t_reply_epoch = 0;
+
 void protocol::lock_tx() {
 	xSemaphoreTake(m_tx_sem, portMAX_DELAY);
 }
@@ -275,6 +281,8 @@ void protocol::unlock_tx() {
 }
 
 void protocol::reset_link_state_locked() {
+	uint32_t next = m_epoch.load(std::memory_order_relaxed) + 1;
+	m_epoch.store(next != 0 ? next : 1, std::memory_order_relaxed);
 	m_rx_buffer_pos = 0;
 	m_tx_seq = 1;
 	m_last_rx_seq = 0;

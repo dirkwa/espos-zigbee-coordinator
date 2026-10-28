@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <esp_err.h>
 
@@ -54,6 +55,10 @@ private:
 
 	uint8_t m_tx_buffer[TX_BUFFER_SIZE];
 	SemaphoreHandle_t m_tx_sem;        /*!< A semaphore handle send_data, becouse it use buffer */
+	// Counts link resets, changed only with m_tx_sem held. Never 0, which
+	// reply_scope reserves for "not a reply".
+	std::atomic<uint32_t> m_epoch{1};
+	static thread_local uint32_t t_reply_epoch;
 
 	esp_err_t on_rx_int(const void* data,size_t size);
 	void on_rx_packet(const ncp_header_t& hdr,const void* data,size_t data_size);
@@ -81,6 +86,24 @@ public:
 	static esp_err_t send_data(const void* data,size_t size) {
 		return instance().send_data_int(data,size);
 	}
+	// The link a request arrived on, read on the app task while it
+	// processes the request.
+	static uint32_t epoch() {
+		return instance().m_epoch.load(std::memory_order_relaxed);
+	}
+	// A reply sent later, from another task, is for the host whose request
+	// it answers. While a scope is open, send_data drops frames on this
+	// task once the link has been reset since `epoch`: a new host would
+	// take the reply's tsn for one of its own requests.
+	class reply_scope {
+	public:
+		explicit reply_scope(uint32_t epoch) : m_prev(t_reply_epoch) { t_reply_epoch = epoch; }
+		~reply_scope() { t_reply_epoch = m_prev; }
+		reply_scope(const reply_scope&) = delete;
+		reply_scope& operator=(const reply_scope&) = delete;
+	private:
+		uint32_t m_prev;
+	};
 	// Back to the state after a boot, for a host that has just connected:
 	// its sequence numbers restart at 0 and it has seen none of ours. App
 	// task only, like on_rx. `cut` runs first with m_tx_sem held, so no frame

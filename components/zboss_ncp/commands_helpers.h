@@ -81,7 +81,9 @@ struct zb_ncp::delayed_cmd_process : public ResolveStrategyT<CmdId>{
     }
     static bool response(int status) {
         zb_ncp::cmd_t saved_cmd;
-        if (ResolveStrategy::resolve_take(saved_cmd)) {
+        uint32_t epoch = 0;
+        if (ResolveStrategy::resolve_take(saved_cmd, epoch)) {
+            protocol::reply_scope scope(epoch);
             uint8_t outdata[Cmd::resp_buffer_size+sizeof(zb_ncp::cmd_t)];
             zb_ncp::cmd_t* out_cmd = reinterpret_cast<zb_ncp::cmd_t*>(outdata);
             *out_cmd = saved_cmd;
@@ -107,6 +109,7 @@ struct single_cmd_delayed {
 	static_assert(CmdId != command_id_t(0),
 	              "single_cmd_delayed: command_id 0 is reserved as the free sentinel");
 	static zb_ncp::cmd_t m_cmd;
+	static inline uint32_t m_epoch = 0;
 
 	// MECH-2: m_cmd is armed by the app task (start_resolve) and read/cleared by
 	// the ZBOSS task (need_resolve / resolve_take) — the same cross-task data-race
@@ -130,6 +133,7 @@ struct single_cmd_delayed {
 			return false;
 		}
 		m_cmd = cmd;
+		m_epoch = protocol::epoch();
 		return true;
 	}
 	// Non-destructive peek: is a request for CmdId currently armed? Used by
@@ -144,12 +148,13 @@ struct single_cmd_delayed {
 	// hit, copies the armed cmd into `out` and frees the slot under the lock; the
 	// blocking response send then runs on the caller's stack-local copy outside
 	// the lock. Mirrors request_cmd_resolver::resolve_take.
-	static bool resolve_take(zb_ncp::cmd_t& out) {
+	static bool resolve_take(zb_ncp::cmd_t& out, uint32_t& epoch) {
 		utils::sem_lock l(mutex());
 		if (m_cmd.command_id != CmdId) {
 			return false;
 		}
 		out = m_cmd;
+		epoch = m_epoch;
 		m_cmd.command_id = command_id_t(0);
 		return true;
 	}
@@ -247,6 +252,7 @@ struct request_cmd_resolver {
 		zb_ncp::cmd_t cmd;
 		size_t old;
 		uint32_t t_exec;   // FreeRTOS tick when the slot entered S_EXEC (watchdog)
+		uint32_t epoch;    // protocol::epoch() of the host that sent it
 		uint8_t tsn;
 		enum state_t : uint8_t {
 			S_NONE,
@@ -273,8 +279,12 @@ struct request_cmd_resolver {
 		// blocks while holding it (bounds priority inheritance).
 		utils::sem_lock l(request_resolver_mutex());
 		request_t* res = nullptr;
+		const uint32_t epoch = protocol::epoch();
 		for (auto& req:storage()) {
-			if (req.state == request_t::S_NONE) {
+			// A previous host's request is as good as free: nothing will
+			// answer it, and its late callback can no longer match the slot.
+			if (req.state == request_t::S_NONE ||
+			    (req.state == request_t::S_EXEC && req.epoch != epoch)) {
 				res = &req;
 				break;
 			}
@@ -299,6 +309,7 @@ struct request_cmd_resolver {
 		}
 		if (res) {
 			res->cmd = cmd;
+			res->epoch = epoch;
 			res->old = old_cntr()++;
 			// Reserve under the lock. S_ALLOCATION is matched by neither the
 			// free-scan (S_NONE) above nor resolve_take() (S_EXEC), so once
@@ -328,10 +339,17 @@ struct request_cmd_resolver {
 	// re-pick the still-S_EXEC slot and reassign it — then the late S_NONE write
 	// clobbered a fresh request. Copying out + freeing up front closes that
 	// window: the blocking send then runs on a local copy nobody else can touch.
+	// A previous host's slot with this tsn is freed and skipped, so its
+	// late callback cannot answer the new host's request that reused the tsn.
 	static bool resolve_take(uint8_t tsn, request_t& out) {
 		utils::sem_lock l(request_resolver_mutex());
+		const uint32_t epoch = protocol::epoch();
 		for (auto& req:storage()) {
 			if (req.state == request_t::S_EXEC && req.tsn == tsn) {
+				if (req.epoch != epoch) {
+					req.state = request_t::S_NONE;
+					continue;
+				}
 				out = req;
 				req.state = request_t::S_NONE;
 				return true;
@@ -353,6 +371,10 @@ struct request_cmd_resolver {
 		utils::sem_lock l(request_resolver_mutex());
 		auto& req = storage()[idx];
 		if (req.state != request_t::S_EXEC || req.old != old) {
+			return false;
+		}
+		if (req.epoch != protocol::epoch()) {
+			req.state = request_t::S_NONE;
 			return false;
 		}
 		out = req;
@@ -477,6 +499,7 @@ struct zb_ncp::request_cmd_process : public request_cmd_resolver<CmdId,Arg> {
         // app-task start_resolve override on the slot.
         typename ResolveStrategy::request_t req;
         if (ResolveStrategy::resolve_take(tsn, req)) {
+        	protocol::reply_scope scope(req.epoch);
         	ESP_LOGD(TAG,"%s::req_cb %d",Cmd::name,int(tsn));
         	auto status = resp_parser<Resp>::get_status(resp);
         	if (Cmd::response_body_is_synthetic(req,status)) {
@@ -521,12 +544,15 @@ struct zb_ncp::request_cmd_process : public request_cmd_resolver<CmdId,Arg> {
             ESP_LOGE(TAG,"%s::do_request failed",Cmd::name);
             zb_buf_free(buf);
             zb_ncp::cmd_t failed_cmd;
+            uint32_t epoch;
             {   // DISP-2: free the slot under the lock; report outside it
                 // (report_failed → send can block).
                 utils::sem_lock l(request_resolver_mutex());
                 failed_cmd = req.cmd;
+                epoch = req.epoch;
                 req.state = ResolveStrategy::request_t::S_NONE;
             }
+            protocol::reply_scope scope(epoch);
             report_failed(failed_cmd,GENERIC_NO_RESOURCES);
         } else {
             {   // DISP-2: publish tsn before S_EXEC, atomically w.r.t. a

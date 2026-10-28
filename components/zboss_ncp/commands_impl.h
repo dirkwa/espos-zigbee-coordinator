@@ -1983,6 +1983,7 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
             if (!sent.valid) {
             	ESP_LOGW(TAG,"%s: confirm on buffer %d without a send record, dropped",Cmd::name,int(param));
             } else if (ResolveStrategy::resolve_take_at(sent.idx, sent.old, req)) {
+            	protocol::reply_scope scope(req.epoch);
             	ESP_LOGD(TAG,"%s::aps_user_payload_callback %d",Cmd::name,int(req.tsn));
 	        	if (ind->status == 0) {
 	        		 Cmd::handle_response(req,ind);
@@ -2111,10 +2112,13 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
     		// buffer per rejected request; the generic helper frees too.
     		zb_buf_free(buf);
     		zb_ncp::cmd_t failed_cmd;
+    		uint32_t epoch;
     		{	utils::sem_lock l(request_resolver_mutex());
     			failed_cmd = req.cmd;
+    			epoch = req.epoch;
     			req.state = ResolveStrategy::request_t::S_NONE;
     		}
+    		protocol::reply_scope scope(epoch);
     		report_failed(failed_cmd,ret);
     		return;
     	}
