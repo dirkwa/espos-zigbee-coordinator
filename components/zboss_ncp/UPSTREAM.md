@@ -45,3 +45,8 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
   left out.
 - **Version** comes from the app description rather than upstream's
   `version.txt`.
+- **Green Power handler kept in the link** (`CMakeLists.txt`): an
+  `INTERFACE` link option `-Wl,--undefined=zb_zcl_green_power_cluster_handler`.
+  `libzboss_stack` calls back into `libesp_zb_api` for it, and in IDF 6's
+  link order the linker has already passed `libesp_zb_api` by then. Upstream
+  builds on IDF 5 without it.

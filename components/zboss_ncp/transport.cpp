@@ -8,6 +8,7 @@
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <lwip/sockets.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -97,8 +98,11 @@ void transport::rx_pump(const uint8_t* data, int readed) {
     utils::sem_lock l(m_output_sem);
     int off = 0;
     while (off < readed) {
+        // protocol::on_rx takes at most its RX_BUFFER_SIZE per call, and a
+        // promotion pumps a read plus the scanned tail before it.
+        const size_t chunk = std::min<size_t>(readed - off, BUF_SIZE);
         size_t sent = xStreamBufferSend(m_output_buf, data + off,
-                                        readed - off,
+                                        chunk,
                                         pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS));
         if (sent == 0) {
             ESP_LOGE(TAG, "output_buf full, dropping %d bytes", readed - off);

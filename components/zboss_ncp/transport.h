@@ -28,7 +28,7 @@ public:
 	static constexpr int HEADER_SIZE = 7;
 
 private:
-	static constexpr size_t BUF_SIZE = 1024;
+	static constexpr size_t BUF_SIZE = 1024;   // == protocol::RX_BUFFER_SIZE
 	static constexpr size_t RINGBUF_SIZE = 1024*20;
 	static constexpr size_t RINGBUF_TIMEOUT_MS = 50;
 	static constexpr size_t TASK_STACK = 1024*4;
