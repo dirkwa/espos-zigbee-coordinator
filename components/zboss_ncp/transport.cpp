@@ -10,17 +10,24 @@
 #include <lwip/sockets.h>
 #include <cerrno>
 #include <cstring>
+#include <initializer_list>
 
 static const char* TAG = "TRNPT";
 
-// SO_SNDTIMEO bounds each ::send, but lwIP restarts that clock whenever a
-// partial send makes progress, so a link that trickles would hold the app
-// task far longer. This is the bound for one whole frame.
-static constexpr uint32_t TCP_FRAME_DEADLINE_MS = 12000;
+// How long one frame may take to leave. The radio is shared with the
+// always-listening coordinator, so Wi-Fi can be starved for seconds, and the
+// app task that sends also serves every Zigbee indication. Each ::send blocks
+// at most SEND_SLICE_MS (SO_SNDTIMEO), so the loop below can stop at this
+// bound rather than a whole socket timeout past it.
+static constexpr uint32_t TCP_FRAME_DEADLINE_MS = 8000;
+static constexpr uint32_t SEND_SLICE_MS = 500;
+
+// A second host must send a ZBOSS frame within this long to take over.
+static constexpr int64_t QUALIFY_TIMEOUT_US = 10LL * 1000 * 1000;
 
 // The framing-level ACK herdsman's open-port handshake waits for
 // (andryblack/esp-coordinator#11). A host connects whenever it likes and may
-// reconnect, so every accepted client gets it, not only the first.
+// reconnect, so every host gets it, not only the first.
 static const uint8_t BOOT_ACK[] = {0xDE, 0xAD, 0x05, 0x00, 0x06, 0x01, 0x8F};
 
 transport::transport() {}
@@ -33,7 +40,8 @@ transport& transport::instance() {
 esp_err_t transport::write_int(const void *buffer, size_t size)
 {
     utils::sem_lock l(m_client_sem);
-    if (m_client < 0) {
+    const int fd = m_client.load(std::memory_order_relaxed);
+    if (fd < 0) {
         // No host: the frame has nobody to go to, which is not an error the
         // app task should log once per frame.
         return ESP_OK;
@@ -41,16 +49,13 @@ esp_err_t transport::write_int(const void *buffer, size_t size)
     const auto* p = static_cast<const uint8_t*>(buffer);
     size_t off = 0;
     const int64_t deadline = esp_timer_get_time() + int64_t(TCP_FRAME_DEADLINE_MS) * 1000;
-    while (off < size) {
-        int n = ::send(m_client, p + off, size - off, 0);
+    while (off < size && esp_timer_get_time() < deadline) {
+        int n = ::send(fd, p + off, size - off, 0);
         if (n > 0) {
             off += n;
-            continue;
+        } else if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            break;
         }
-        if (n < 0 && (errno == EINTR || errno == EAGAIN) && esp_timer_get_time() < deadline) {
-            continue;
-        }
-        break;
     }
     if (off == size) {
         return ESP_OK;
@@ -59,8 +64,16 @@ esp_err_t transport::write_int(const void *buffer, size_t size)
     // cannot carry on: end it, and the host reconnects to fresh boot frames.
     ESP_LOGE(TAG, "send stalled at %u/%u bytes (errno %d), closing the host link",
              unsigned(off), unsigned(size), errno);
-    ::shutdown(m_client, SHUT_RDWR);
+    ::shutdown(fd, SHUT_RDWR);
     return ESP_FAIL;
+}
+
+void transport::send_direct(int fd, const void* data, size_t size) {
+    // Boot frames on a socket that is not routed yet. Small and the first
+    // bytes on a fresh connection, so one bounded send takes them.
+    if (::send(fd, data, size, 0) != int(size)) {
+        ESP_LOGW(TAG, "boot frame not sent (errno %d)", errno);
+    }
 }
 
 void transport::rx_pump(const uint8_t* data, int readed) {
@@ -102,38 +115,98 @@ void transport::rx_pump(const uint8_t* data, int readed) {
 }
 
 void transport::close_client_int() {
-    utils::sem_lock l(m_client_sem);
-    if (m_client >= 0) {
-        // shutdown, not close: the server task owns the descriptor and
-        // closes it when its recv returns, so the number cannot be reused
-        // while it is still selecting on it.
-        ::shutdown(m_client, SHUT_RDWR);
+    // No semaphore: a stalled send can hold it for seconds, and this runs on
+    // the restart path, sometimes from the esp_timer task. shutdown is safe
+    // beside a send on the same socket; only the server task closes it.
+    const int fd = m_client.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
     }
 }
 
 void transport::drop_fd(int fd) {
     utils::sem_lock l(m_client_sem);
-    if (m_client == fd) m_client = -1;
-    if (m_pending == fd) m_pending = -1;
+    if (m_client.load(std::memory_order_relaxed) == fd) {
+        m_client.store(-1, std::memory_order_relaxed);
+    }
+    if (m_switching == fd) {
+        m_switching = -1;
+    }
     ::close(fd);
 }
 
-void transport::on_link_reset_int() {
+void transport::promote(int fd) {
     {
         utils::sem_lock l(m_client_sem);
-        m_client = m_pending;
-        m_pending = -1;
-        if (m_client >= 0) {
-            ::send(m_client, BOOT_ACK, sizeof(BOOT_ACK), 0);
+        m_switching = fd;
+    }
+    // The fd rides in the event so that a host replaced or gone before the
+    // app task gets to it is not switched in: on_link_reset checks it is
+    // still the one switching.
+    app::ctx_t ev = {.event = app::EVENT_LINK_RESET, .size = uint16_t(fd)};
+    while (app::send_event(ev) != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "host connected");
+}
+
+void transport::on_link_reset_int(int fd) {
+    {
+        utils::sem_lock l(m_client_sem);
+        if (m_switching != fd) {
+            return;
+        }
+        // Frames queued from here on were stamped for the previous host.
+        m_client.store(-1, std::memory_order_relaxed);
+    }
+    // The new host's sequence numbers start at 0, so ours restart as after a
+    // boot.
+    protocol::reset_link_state();
+    {
+        utils::sem_lock l(m_client_sem);
+        if (m_switching != fd) {
+            return;
+        }
+        send_direct(fd, BOOT_ACK, sizeof(BOOT_ACK));
+        // Before the stack has loaded its NVRAM the boot-ready frame would let
+        // the host read default PAN values and form a new network over the
+        // stored one (andryblack/esp-coordinator#5); on_boot_ready sends it
+        // once the dataset is loaded.
+        if (m_boot_ready) {
+            size_t n = 0;
+            const uint8_t* frame = zb_ncp::boot_ready_frame(&n);
+            send_direct(fd, frame, n);
         }
     }
-    protocol::reset_link_state();
-    // Before the stack has loaded its NVRAM the boot-ready frame would let the
-    // host read default PAN values and form a new network over the stored
-    // one (andryblack/esp-coordinator#5); continue_zboss sends it once the
-    // dataset is loaded, to whichever host is connected then.
-    if (zb_ncp::boot_ready()) {
-        zb_ncp::send_boot_ready_frame();
+    // Behind everything already queued, so all of that is dropped, and ahead
+    // of anything the new host's first request produces.
+    app::ctx_t ev = {.event = app::EVENT_LINK_ACTIVE, .size = uint16_t(fd)};
+    while (app::send_event(ev) != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void transport::on_link_active_int(int fd) {
+    utils::sem_lock l(m_client_sem);
+    if (m_switching == fd) {
+        m_client.store(fd, std::memory_order_relaxed);
+        m_switching = -1;
+    }
+}
+
+void transport::on_boot_ready_int() {
+    m_boot_ready = true;
+    utils::sem_lock l(m_client_sem);
+    size_t n = 0;
+    const uint8_t* frame = zb_ncp::boot_ready_frame(&n);
+    const int fd = m_client.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+        send_direct(fd, frame, n);
+    }
+    // A host still between reset and active has had its boot frames already,
+    // without this one: it goes to that socket now.
+    if (m_switching >= 0) {
+        send_direct(m_switching, frame, n);
     }
 }
 
@@ -148,7 +221,7 @@ static void set_client_options(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     // lwIP's default keepalive idle is two hours, so a host that vanished
-    // without a FIN (a crash, a pulled cable) would hold the only client slot
+    // without a FIN (a crash, a pulled cable) would hold the only host slot
     // that long. 15 s matches herdsman's own setKeepAlive; three missed probes
     // 3 s apart then end the connection.
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
@@ -156,28 +229,27 @@ static void set_client_options(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-    // The radio is shared with the always-listening coordinator, so Wi-Fi can
-    // be starved for seconds. Without a bound a blocking send would park the
-    // app task, which also serves every Zigbee indication.
     struct timeval to = {};
-    to.tv_sec = 8;
+    to.tv_usec = SEND_SLICE_MS * 1000;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
 }
 
-void transport::serve_client(int fd) {
-    set_client_options(fd);
-    {
-        utils::sem_lock l(m_client_sem);
-        m_pending = fd;
+// Index of the first byte of a DE AD signature in buf, -1 when it began with
+// the 0xDE that ended the previous chunk, -2 when there is none yet.
+// `pending_de` carries that last-byte state across chunks.
+static int find_signature(const uint8_t* buf, int len, bool& pending_de) {
+    if (pending_de && len > 0 && buf[0] == 0xAD) {
+        pending_de = false;
+        return -1;
     }
-    // The new host is switched in on the app task, queued behind the
-    // previous host's bytes and frames, so none of those reaches the new
-    // host or is read as the start of its stream.
-    app::ctx_t reset = {.event = app::EVENT_LINK_RESET, .size = 0};
-    while (app::send_event(reset) != ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    for (int i = 0; i + 1 < len; ++i) {
+        if (buf[i] == 0xDE && buf[i + 1] == 0xAD) {
+            pending_de = false;
+            return i;
+        }
     }
-    ESP_LOGI(TAG, "host connected");
+    pending_de = (len > 0 && buf[len - 1] == 0xDE);
+    return -2;
 }
 
 void transport::task_int() {
@@ -203,49 +275,97 @@ void transport::task_int() {
     }
     ESP_LOGI(TAG, "NCP listening on tcp :%d", CONFIG_ZBOSS_NCP_TCP_PORT);
 
-    int fd = -1;
+    int host = -1;           // the host, promoted
+    int cand = -1;           // a second connection that has not sent DE AD yet
+    bool cand_de = false;
+    int64_t cand_since = 0;
     while (true) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(m_listen, &rfds);
         int maxfd = m_listen;
-        if (fd >= 0) {
-            FD_SET(fd, &rfds);
-            if (fd > maxfd) maxfd = fd;
+        for (int fd : {host, cand}) {
+            if (fd >= 0) {
+                FD_SET(fd, &rfds);
+                if (fd > maxfd) maxfd = fd;
+            }
         }
-        if (::select(maxfd + 1, &rfds, nullptr, nullptr, nullptr) < 0) {
+        struct timeval tv = {};
+        tv.tv_sec = 1;
+        int ready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
+        if (ready < 0) {
             if (errno != EINTR) vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        if (FD_ISSET(m_listen, &rfds)) {
-            int nfd = ::accept(m_listen, nullptr, nullptr);
-            if (nfd >= 0) {
-                // One host at a time: the NCP has one link state. A host that
-                // reconnects gets the slot at once rather than waiting out the
-                // keepalive on the half-open connection it left behind.
-                if (fd >= 0) {
-                    ESP_LOGW(TAG, "new host replaces the connected one");
-                    drop_fd(fd);
-                }
-                fd = nfd;
-                serve_client(fd);
-            }
-            continue;
+        if (cand >= 0 && esp_timer_get_time() - cand_since > QUALIFY_TIMEOUT_US) {
+            ESP_LOGW(TAG, "second connection sent no ZBOSS frame, dropped");
+            ::close(cand);
+            cand = -1;
         }
 
-        if (fd >= 0 && FD_ISSET(fd, &rfds)) {
-            int n = ::recv(fd, m_temp_buf, BUF_SIZE, 0);
+        if (FD_ISSET(m_listen, &rfds)) {
+            int fd = ::accept(m_listen, nullptr, nullptr);
+            if (fd >= 0) {
+                set_client_options(fd);
+                if (host < 0) {
+                    // Nobody to protect: a host that connects to an idle
+                    // coordinator is the host.
+                    host = fd;
+                    promote(host);
+                } else {
+                    if (cand >= 0) {
+                        ::close(cand);
+                    }
+                    cand = fd;
+                    cand_de = false;
+                    cand_since = esp_timer_get_time();
+                }
+            }
+        }
+
+        if (cand >= 0 && FD_ISSET(cand, &rfds)) {
+            int n = ::recv(cand, m_temp_buf, BUF_SIZE, 0);
+            if (n <= 0 && !(n < 0 && (errno == EINTR || errno == EAGAIN))) {
+                ::close(cand);
+                cand = -1;
+            } else if (n > 0) {
+                int sig = find_signature(m_temp_buf, n, cand_de);
+                if (sig != -2) {
+                    // A real host: a ZBOSS host reconnecting from a session
+                    // this end still holds, half open, takes over now instead
+                    // of after the keepalive gives up on the old one.
+                    ESP_LOGW(TAG, "new host replaces the connected one");
+                    drop_fd(host);
+                    host = cand;
+                    cand = -1;
+                    promote(host);
+                    if (sig == -1) {
+                        const uint8_t de = 0xDE;
+                        rx_pump(&de, 1);
+                        rx_pump(m_temp_buf, n);
+                    } else {
+                        rx_pump(m_temp_buf + sig, n - sig);
+                    }
+                }
+            }
+        }
+
+        if (host >= 0 && FD_ISSET(host, &rfds)) {
+            int n = ::recv(host, m_temp_buf, BUF_SIZE, 0);
             if (n > 0) {
                 rx_pump(m_temp_buf, n);
-                continue;
+            } else if (!(n < 0 && (errno == EINTR || errno == EAGAIN))) {
+                ESP_LOGW(TAG, "host disconnected");
+                drop_fd(host);
+                host = -1;
+                // A connection that waited for the slot has it now.
+                if (cand >= 0) {
+                    host = cand;
+                    cand = -1;
+                    promote(host);
+                }
             }
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
-                continue;
-            }
-            ESP_LOGW(TAG, "host disconnected");
-            drop_fd(fd);
-            fd = -1;
         }
     }
 }

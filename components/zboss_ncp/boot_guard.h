@@ -41,4 +41,9 @@ void mark_zboss_alive();
 // Called from the NCP_RESET path before the restart.
 void clear();
 
+// Stop the deadline without marking the stack alive: the NCP did not start
+// at all (zboss_ncp_start failed), so there is no early-boot hang to catch,
+// and the restart would only loop.
+void disarm();
+
 }  // namespace boot_guard

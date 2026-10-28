@@ -8,20 +8,35 @@ at commit `b292868d1ae5426dc048ee7749d7a710e1ccd789` (2026-10-19). It is
 MIT-licensed; `LICENSE` here is upstream's and covers the files that came
 from it.
 
-Copied from upstream's `main/`, then changed for espOS (see the git history
-of this directory for the exact diff):
+Copied from upstream's `main/`, then changed for espOS. Every local change:
 
-- **Host link over TCP, not USB or UART.** `transport` serves one client on
-  a TCP port (`CONFIG_ZBOSS_NCP_TCP_PORT`, 6638 by default, as upstream's
-  Wi-Fi build). espOS brings up Wi-Fi, so the USB-Serial/JTAG and UART
-  backends are gone.
+- **Host link over TCP, not USB or UART** (`transport`). One host on
+  `CONFIG_ZBOSS_NCP_TCP_PORT` (6638, as upstream's Wi-Fi build). While a host
+  is connected, a second connection takes over only once it sends a ZBOSS
+  frame, as upstream's DE AD gate does for its interfaces. A new host is
+  switched in on the app task in two events (`EVENT_LINK_RESET`,
+  `EVENT_LINK_ACTIVE`): the link state is reset and the boot frames go to it
+  directly, and frames stamped for the previous host are dropped. Sends are
+  bounded at 8 s per frame in 0.5 s slices.
+- **Link state reset** (`protocol::reset_link_state`): sequence numbers and
+  the receive buffer back to boot state for each new host.
+- **Boot frames per host.** Upstream sends the framing ACK and the
+  boot-ready frame once at boot; here every host gets them when it connects,
+  the boot-ready frame only once the stack has loaded its NVRAM.
+  `zb_ncp::send_boot_ready_frame` posts `EVENT_BOOT_READY` so that this is
+  ordered against hosts connecting on the app task.
+- **Restarts send the host a FIN.** Every upstream `esp_restart()` is
+  `transport::restart()`.
 - **Its own NVS partition.** espOS keeps Wi-Fi credentials, the Signal K
   token and the device keys in `nvs`. Upstream's raw network backup reads
   and restores the whole `nvs` partition, and its factory reset erases it.
-  Here both use `zb_nvs`, a 24 KB partition of the coordinator's own, the
-  size of upstream's `nvs`, so a backup image keeps upstream's layout.
-- **espOS owns start-up.** NVS, logging and the restart path are espOS's;
-  `zboss_ncp_start()` runs the NCP once espOS is up. Upstream's board
-  quirks (the Seeed XIAO antenna switch) are left out.
+  Here those, the `restore_pend` namespace and the NVS init all use
+  `zb_nvs`, a 24 KB partition of the coordinator's own, the size of
+  upstream's `nvs`, so a backup image keeps upstream's layout.
+- **espOS owns start-up.** Upstream's `main.cpp` is `ncp_boot.cpp`:
+  `zboss_ncp_start()` replaces `app_main`, the event loop runs on its own
+  `ncp_app` task, and a failed start disarms the boot guard rather than
+  restart-looping. Upstream's board quirk (the Seeed XIAO antenna switch) is
+  left out.
 - **Version** comes from the app description rather than upstream's
   `version.txt`.

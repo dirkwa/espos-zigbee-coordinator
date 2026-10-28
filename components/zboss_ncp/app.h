@@ -13,7 +13,9 @@ public:
 	   EVENT_INPUT,                /*!< Input event from NCP to host */
 	   EVENT_OUTPUT,               /*!< Output event from host to NCP */
 	   EVENT_RESET,                /*!< Reset event from host to NCP */
-	   EVENT_LINK_RESET,           /*!< A new host connected: switch to it (transport) */
+	   EVENT_LINK_RESET,           /*!< A host qualified: reset the link for it (size = its fd) */
+	   EVENT_LINK_ACTIVE,          /*!< Route frames to that host from here on (size = its fd) */
+	   EVENT_BOOT_READY,           /*!< The stack is up: send the boot-ready frame */
 	};
 	struct ctx_t {
 		event_t event;	/*!< The event between the host and NCP */

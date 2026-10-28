@@ -7,6 +7,17 @@
 #include <freertos/stream_buffer.h>
 #include "sdkconfig.h"
 
+// The host link: one TCP client at a time. A connection becomes the host in
+// three steps, so that no byte or frame of one host's session reaches the
+// other's:
+//   1. the server task accepts it; while another host is connected it only
+//      takes over once it sends a ZBOSS frame (DE AD), so a port scan or a
+//      monitoring probe never ends a live session;
+//   2. app task, EVENT_LINK_RESET: the link state is reset and the boot
+//      frames go to the new socket directly;
+//   3. app task, EVENT_LINK_ACTIVE: frames are routed to it. Everything
+//      queued between 1 and 3 was stamped for the previous host and is
+//      dropped.
 class transport {
 private:
 	static constexpr size_t BUF_SIZE = 1024;
@@ -24,27 +35,32 @@ private:
     SemaphoreHandle_t m_input_sem;        /*!< A semaphore handle for process the data from NCP */
     SemaphoreHandle_t m_output_sem;       /*!< Serialises writers of m_output_buf
                                                (FreeRTOS stream buffers are single-writer) */
-	// Held while a send uses m_client and while the server task closes or
-	// replaces it, so a frame never goes to a socket that is being torn down
-	// or to the next client that reuses the fd number.
-	SemaphoreHandle_t m_client_sem;
+	// Held by every send to a host socket and by the server task while it
+	// closes one, so a frame never goes to a socket being torn down or to the
+	// next connection that reuses its fd number.
+	SemaphoreHandle_t m_client_sem = nullptr;
 
-	// The host's socket, -1 while no host is connected. Frames for a missing
-	// host are dropped: a host that connects later starts from the boot frames
-	// the server sends it, not from a backlog.
-	int m_client = -1;
-	// Accepted, not yet switched in by on_link_reset().
-	int m_pending = -1;
+	// The socket frames are routed to; -1 while there is none, and frames are
+	// then dropped. Atomic so that close_client() can read it without the
+	// semaphore, which a stalled send may hold for seconds.
+	std::atomic<int> m_client{-1};
+	// The socket between steps 1 and 3 above.
+	int m_switching = -1;
+	// App task only.
+	bool m_boot_ready = false;
 	int m_listen = -1;
 
 	uint8_t m_temp_buf[BUF_SIZE];
 
 	esp_err_t write_int(const void* data,size_t size);
 	void task_int();
-	void serve_client(int fd);
-	void close_client_int();
+	void promote(int fd);
 	void drop_fd(int fd);
-	void on_link_reset_int();
+	void close_client_int();
+	void on_link_reset_int(int fd);
+	void on_link_active_int(int fd);
+	void on_boot_ready_int();
+	void send_direct(int fd, const void* data, size_t size);
 	void rx_pump(const uint8_t* data, int readed);
 
 	static void task(void *pvParameter) {
@@ -63,11 +79,15 @@ public:
 	static esp_err_t process_input(void* buffer,size_t size) { return instance().process_input_int(buffer,size); }
 	static size_t output_receive(void* buffer,size_t size);
 
-	// Close the host's connection with a FIN. Every restart goes through
-	// restart() below so that the host sees the link end at once instead of
-	// waiting out its keepalive on a connection the reboot silently dropped.
+	// App task, from the events named above.
+	static void on_link_reset(int fd) { instance().on_link_reset_int(fd); }
+	static void on_link_active(int fd) { instance().on_link_active_int(fd); }
+	static void on_boot_ready() { instance().on_boot_ready_int(); }
+
+	// End the host's connection with a FIN. The NCP's own restarts go
+	// through restart() so the host sees the link end at once instead of
+	// waiting out its keepalive; a restart espOS makes (an OTA, the web UI)
+	// does not, and the host notices within the keepalive's ~24 s.
 	static void close_client() { instance().close_client_int(); }
-	// App task: switch to the host accepted last (app::EVENT_LINK_RESET).
-	static void on_link_reset() { instance().on_link_reset_int(); }
 	[[noreturn]] static void restart();
 };

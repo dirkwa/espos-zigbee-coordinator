@@ -9,7 +9,6 @@
 #include "nwk/esp_zigbee_nwk.h"
 #include "esp_zigbee_secur.h"
 #include <nvs.h>
-#include <atomic>
 #include "app.h"
 // NOTE: deliberately NOT including esp_zigbee_core.h — referencing any of its
 // symbols (e.g. esp_zb_set_primary_network_channel_set) pulls in
@@ -543,28 +542,31 @@ void zb_ncp::request_watchdog_tick() {
     }
 }
 
-static std::atomic<bool> s_boot_ready{false};
+static const uint8_t boot_ready_frame[] = {
+    0xDE, 0xAD,             // signature
+    0x0E, 0x00,             // packet_len = 14
+    0x06,                   // packet_type = ZBOSS_NCP_API_HL
+    0xC0,                   // flags: first_fragment=1, last_fragment=1
+    0x5D,                   // header CRC8
+    0x50, 0xD4,             // payload CRC16
+    0x00,                   // version
+    0x01,                   // type = RESPONSE
+    0x02, 0x00,             // command_id = NCP_RESET (0x0002, LE)
+    0xFF,                   // tsn = 0xFF (unsolicited-boot sentinel)
+    0x00, 0x00              // CATEGORY_GENERIC, GENERIC_OK
+};
 
-bool zb_ncp::boot_ready() {
-    return s_boot_ready.load(std::memory_order_relaxed);
+const uint8_t* zb_ncp::boot_ready_frame(size_t* size) {
+    *size = sizeof(::boot_ready_frame);
+    return ::boot_ready_frame;
 }
 
 void zb_ncp::send_boot_ready_frame() {
-    s_boot_ready.store(true, std::memory_order_relaxed);
-    static const uint8_t boot_ready_frame[] = {
-        0xDE, 0xAD,             // signature
-        0x0E, 0x00,             // packet_len = 14
-        0x06,                   // packet_type = ZBOSS_NCP_API_HL
-        0xC0,                   // flags: first_fragment=1, last_fragment=1
-        0x5D,                   // header CRC8
-        0x50, 0xD4,             // payload CRC16
-        0x00,                   // version
-        0x01,                   // type = RESPONSE
-        0x02, 0x00,             // command_id = NCP_RESET (0x0002, LE)
-        0xFF,                   // tsn = 0xFF (unsolicited-boot sentinel)
-        0x00, 0x00              // CATEGORY_GENERIC, GENERIC_OK
-    };
-    transport::send(boot_ready_frame, sizeof(boot_ready_frame));
+    // Through the app task rather than straight into the transport queue:
+    // there it is ordered against hosts connecting, so a host that connects
+    // around this moment gets the frame exactly once (transport::on_boot_ready).
+    app::ctx_t ev = {.event = app::EVENT_BOOT_READY, .size = 0};
+    app::send_event(ev);
 }
 
 void zb_ncp::continue_zboss(uint8_t arg) {

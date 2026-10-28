@@ -103,7 +103,13 @@ esp_err_t app::process_event(const ctx_t& ctx) {
             transport::restart();
         } break;
         case EVENT_LINK_RESET:
-            transport::on_link_reset();
+            transport::on_link_reset(ctx.size);
+            break;
+        case EVENT_LINK_ACTIVE:
+            transport::on_link_active(ctx.size);
+            break;
+        case EVENT_BOOT_READY:
+            transport::on_boot_ready();
             break;
         default:
             break;

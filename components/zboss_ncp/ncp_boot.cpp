@@ -135,6 +135,14 @@ void clear()
     g_boot_breadcrumb = BOOT_BC_MAGIC | 0u;
 }
 
+void disarm()
+{
+    if (s_deadline) {
+        esp_timer_stop(s_deadline);
+    }
+    clear();
+}
+
 }  // namespace boot_guard
 
 esp_err_t zboss_ncp_start(void)
@@ -148,8 +156,15 @@ esp_err_t zboss_ncp_start(void)
     boot_guard::init();
     handle_pending_erase();
     esp_err_t err = app::init();
-    if (err != ESP_OK) {
-        return err;
+    if (err == ESP_OK) {
+        err = app::start();
     }
-    return app::start();
+    if (err != ESP_OK) {
+        // A table without the coordinator's partitions (a board first
+        // flashed with another firmware, then updated over the air) fails
+        // here every boot. Restarting would only loop; staying up keeps Wi-Fi
+        // and OTA reachable.
+        boot_guard::disarm();
+    }
+    return err;
 }
