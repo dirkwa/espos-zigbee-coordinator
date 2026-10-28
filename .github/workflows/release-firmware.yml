@@ -372,7 +372,10 @@ jobs:
           # removing what this run created.
           if [ -f "${RUNNER_TEMP}/release-assets-was-absent" ]; then
             echo "release-assets did not exist before this run; deleting it"
-            git push -q --delete "$remote" release-assets \
+            # Through the API: this job has no checkout, and git push needs
+            # a repository to run in.
+            GH_TOKEN="$TOKEN" gh api -X DELETE \
+              "repos/${REPO}/git/refs/heads/release-assets" >/dev/null \
               || echo "::warning::could not delete release-assets"
             exit 0
           fi
