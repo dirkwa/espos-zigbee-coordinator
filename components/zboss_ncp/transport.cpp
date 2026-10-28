@@ -122,6 +122,7 @@ bool transport::rx_pump(const uint8_t* data, int readed) {
         while (app::post_event(ncp_event, pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS)) != ESP_OK) {
             if (esp_timer_get_time() >= deadline) {
                 ESP_LOGE(TAG, "event queue full, %u host bytes orphaned", unsigned(sent));
+                m_orphaned.fetch_add(sent);
                 return false;
             }
         }
@@ -206,7 +207,26 @@ void transport::promote(int fd) {
     ESP_LOGI(TAG, "host connected");
 }
 
+void transport::discard_orphaned() {
+    // Every event queued before this one has claimed its bytes, and the
+    // host that orphaned these was dropped before any later host's bytes
+    // were pumped, so they are the oldest in the buffer. A count raised
+    // after this ran waits for the next host's reset, with nothing written
+    // in between.
+    uint8_t sink[64];
+    size_t left = m_orphaned.load();
+    while (left > 0) {
+        size_t n = xStreamBufferReceive(m_output_buf, sink, std::min(left, sizeof(sink)), 0);
+        if (n == 0) {
+            break;
+        }
+        left -= n;
+        m_orphaned.fetch_sub(n);
+    }
+}
+
 void transport::on_link_reset_int(uint16_t gen) {
+    discard_orphaned();
     protocol::reset_link_state([&]() {
         utils::sem_lock l(m_client_sem);
         if (gen != m_switching_gen) {

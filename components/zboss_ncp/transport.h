@@ -68,6 +68,11 @@ private:
 	std::atomic<bool> m_boot_ready{false};
 	std::atomic<bool> m_boot_ready_req{false};
 
+	// Host bytes in m_output_buf whose EVENT_OUTPUT could not be queued.
+	// The app task drops them before the next host's link reset.
+	std::atomic<size_t> m_orphaned{0};
+	void discard_orphaned();
+
 	int m_listen = -1;
 
 	uint8_t m_temp_buf[BUF_SIZE];

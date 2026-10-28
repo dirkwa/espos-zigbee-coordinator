@@ -22,7 +22,8 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
   which is `protocol::RX_BUFFER_SIZE`. A promotion pumps a read plus the
   scanned header tail, and a larger chunk overflows `protocol::on_rx`. A
   chunk whose bytes or event cannot be queued within a second ends the host
-  link, since the stream would be shifted from there on.
+  link, since the stream would be shifted from there on, and the bytes it
+  left unclaimed are dropped before the next host's link reset.
 - **NCP-to-host frames in a message buffer**, not a stream buffer, and each
   `EVENT_INPUT` drains all of them. A frame whose event was dropped on a full
   queue then goes out with the next drain instead of shifting every frame
