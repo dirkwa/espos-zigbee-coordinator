@@ -184,7 +184,10 @@ bool transport::add_candidate(int slot, int fd) {
     return send_all(fd, frame, n);
 }
 
-void transport::promote(int fd) {
+// The app task can be several frames into stalled sends to the previous host.
+static constexpr uint32_t LINK_RESET_WAIT_MS = 15000;
+
+bool transport::promote(int fd) {
     uint16_t gen;
     {
         utils::sem_lock l(m_client_sem);
@@ -203,8 +206,29 @@ void transport::promote(int fd) {
     // next connection. Only the server task posts these, never the app task
     // that drains the queue, so waiting for room cannot deadlock.
     app::ctx_t ev = {.event = app::EVENT_LINK_RESET, .size = gen};
+    xQueueReset(m_reset_done);
     app::post_event(ev, portMAX_DELAY);
+    // The host's bytes go in only once its reset has run: before it, they
+    // would sit among the previous host's in m_output_buf, where the reset
+    // could not tell the two apart.
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(LINK_RESET_WAIT_MS);
+    uint32_t done = 0;
+    while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if (now >= deadline ||
+            xQueueReceive(m_reset_done, &done, deadline - now) != pdTRUE) {
+            ESP_LOGE(TAG, "link reset did not run, dropping the new host");
+            return false;
+        }
+        if ((done & 0xFFFF) == gen) {
+            break;
+        }
+    }
+    if ((done >> 16) == 0) {
+        return false;
+    }
     ESP_LOGI(TAG, "host connected");
+    return true;
 }
 
 void transport::discard_orphaned() {
@@ -227,6 +251,7 @@ void transport::discard_orphaned() {
 
 void transport::on_link_reset_int(uint16_t gen) {
     discard_orphaned();
+    bool ok = false;
     protocol::reset_link_state([&]() {
         utils::sem_lock l(m_client_sem);
         if (gen != m_switching_gen) {
@@ -246,8 +271,11 @@ void transport::on_link_reset_int(uint16_t gen) {
         m_client.store(m_switching.load(std::memory_order_relaxed), std::memory_order_relaxed);
         m_switching.store(-1, std::memory_order_relaxed);
         m_switching_gen = 0;
+        ok = true;
         return true;
     });
+    const uint32_t done = uint32_t(gen) | (uint32_t(ok) << 16);
+    xQueueOverwrite(m_reset_done, &done);
 }
 
 void transport::poll_boot_ready_int(void* buffer, size_t size) {
@@ -424,10 +452,10 @@ void transport::task_int() {
                         }
                         host = c.fd;
                         c.fd = -1;
-                        // Posted before the bytes below, so the reset runs
-                        // ahead of the new host's first request.
-                        promote(host);
-                        if (!rx_pump(m_scan_buf + at, len - at)) {
+                        if (!promote(host)) {
+                            drop_fd(host);
+                            host = -1;
+                        } else if (!rx_pump(m_scan_buf + at, len - at)) {
                             ESP_LOGW(TAG, "host bytes lost, closing the host link");
                             drop_fd(host);
                             host = -1;
@@ -550,7 +578,8 @@ esp_err_t transport::init_int() {
     m_input_sem = xSemaphoreCreateMutex();
     m_output_sem = xSemaphoreCreateMutex();
     m_client_sem = xSemaphoreCreateMutex();
-    if (!m_input_sem || !m_output_sem || !m_client_sem) {
+    m_reset_done = xQueueCreate(1, sizeof(uint32_t));
+    if (!m_input_sem || !m_output_sem || !m_client_sem || !m_reset_done) {
         ESP_LOGE(TAG, "semaphore create error");
         return ESP_ERR_NO_MEM;
     }

@@ -15,7 +15,8 @@
 //      CRC, so a port scan or a monitoring probe never ends a live session,
 //      and a host reconnecting from a half-open session takes over at once.
 //   2. The server task then puts it in the switching slot and posts
-//      EVENT_LINK_RESET with its generation, ahead of the bytes it sent.
+//      EVENT_LINK_RESET with its generation, and passes on the bytes it
+//      sent only once the app task reports that reset done.
 //   3. The app task resets the link state and, in the same step, switches
 //      the route to it and drops every frame still queued, all of them
 //      stamped for the previous host.
@@ -51,6 +52,9 @@ private:
 	// between the slots below, so a frame never goes to a socket being torn
 	// down or to the next connection that reuses its fd number.
 	SemaphoreHandle_t m_client_sem = nullptr;
+	// App task to server task: {generation, reset ran} of the last
+	// EVENT_LINK_RESET.
+	QueueHandle_t m_reset_done = nullptr;
 
 	// The slots of the steps above. Atomic so that close_client() can read
 	// them without the semaphore, which a stalled send may hold.
@@ -84,7 +88,9 @@ private:
 	void task_int();
 	// `slot` is the server task's index for it, mirrored in m_cands.
 	bool add_candidate(int slot, int fd);
-	void promote(int fd);
+	// Server task: false when the host's link reset did not run for it, and
+	// the host must be dropped.
+	bool promote(int fd);
 	void drop_fd(int fd);
 	void close_client_int();
 	void on_link_reset_int(uint16_t gen);
