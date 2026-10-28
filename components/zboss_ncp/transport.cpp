@@ -37,16 +37,9 @@ transport& transport::instance() {
 	return s_transport;
 }
 
-esp_err_t transport::write_int(const void *buffer, size_t size)
+bool transport::send_all(int fd, const void* data, size_t size)
 {
-    utils::sem_lock l(m_client_sem);
-    const int fd = m_client.load(std::memory_order_relaxed);
-    if (fd < 0) {
-        // No host: the frame has nobody to go to, which is not an error the
-        // app task should log once per frame.
-        return ESP_OK;
-    }
-    const auto* p = static_cast<const uint8_t*>(buffer);
+    const auto* p = static_cast<const uint8_t*>(data);
     size_t off = 0;
     const int64_t deadline = esp_timer_get_time() + int64_t(TCP_FRAME_DEADLINE_MS) * 1000;
     while (off < size && esp_timer_get_time() < deadline) {
@@ -58,22 +51,26 @@ esp_err_t transport::write_int(const void *buffer, size_t size)
         }
     }
     if (off == size) {
-        return ESP_OK;
+        return true;
     }
     // A frame cut short leaves the host's parser mid-frame, so the link
     // cannot carry on: end it, and the host reconnects to fresh boot frames.
     ESP_LOGE(TAG, "send stalled at %u/%u bytes (errno %d), closing the host link",
              unsigned(off), unsigned(size), errno);
     ::shutdown(fd, SHUT_RDWR);
-    return ESP_FAIL;
+    return false;
 }
 
-void transport::send_direct(int fd, const void* data, size_t size) {
-    // Boot frames on a socket that is not routed yet. Small and the first
-    // bytes on a fresh connection, so one bounded send takes them.
-    if (::send(fd, data, size, 0) != int(size)) {
-        ESP_LOGW(TAG, "boot frame not sent (errno %d)", errno);
+esp_err_t transport::write_int(const void *buffer, size_t size)
+{
+    utils::sem_lock l(m_client_sem);
+    const int fd = m_client.load(std::memory_order_relaxed);
+    if (fd < 0) {
+        // No host: the frame has nobody to go to, which is not an error the
+        // app task should log once per frame.
+        return ESP_OK;
     }
+    return send_all(fd, buffer, size) ? ESP_OK : ESP_FAIL;
 }
 
 void transport::rx_pump(const uint8_t* data, int readed) {
@@ -117,96 +114,104 @@ void transport::rx_pump(const uint8_t* data, int readed) {
 void transport::close_client_int() {
     // No semaphore: a stalled send can hold it for seconds, and this runs on
     // the restart path, sometimes from the esp_timer task. shutdown is safe
-    // beside a send on the same socket; only the server task closes it.
-    const int fd = m_client.load(std::memory_order_relaxed);
-    if (fd >= 0) {
-        ::shutdown(fd, SHUT_RDWR);
+    // beside a send on the same socket; only the server task closes one.
+    for (int fd : {m_client.load(), m_switching.load()}) {
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
     }
 }
 
 void transport::drop_fd(int fd) {
+    if (fd < 0) {
+        return;
+    }
     utils::sem_lock l(m_client_sem);
     if (m_client.load(std::memory_order_relaxed) == fd) {
         m_client.store(-1, std::memory_order_relaxed);
     }
-    if (m_switching == fd) {
-        m_switching = -1;
+    if (m_switching.load(std::memory_order_relaxed) == fd) {
+        m_switching.store(-1, std::memory_order_relaxed);
+        m_switching_gen = 0;
+    }
+    if (m_candidate == fd) {
+        m_candidate = -1;
     }
     ::close(fd);
 }
 
+void transport::add_candidate(int fd) {
+    utils::sem_lock l(m_client_sem);
+    m_candidate = fd;
+    // The boot frames go out on accept: a host waits for them before it
+    // sends anything, and it is its first frame that makes it the host.
+    // Under the semaphore with the m_boot_ready check, so the boot-ready
+    // frame reaches it exactly once whether the stack comes up before or
+    // after this.
+    if (send_all(fd, BOOT_ACK, sizeof(BOOT_ACK)) && m_boot_ready) {
+        size_t n = 0;
+        const uint8_t* frame = zb_ncp::boot_ready_frame(&n);
+        send_all(fd, frame, n);
+    }
+}
+
 void transport::promote(int fd) {
+    uint16_t gen;
     {
         utils::sem_lock l(m_client_sem);
-        m_switching = fd;
+        if (++m_gen == 0) ++m_gen;
+        gen = m_gen;
+        m_candidate = -1;
+        m_switching.store(fd, std::memory_order_relaxed);
+        m_switching_gen = gen;
     }
-    // The fd rides in the event so that a host replaced or gone before the
-    // app task gets to it is not switched in: on_link_reset checks it is
-    // still the one switching.
-    app::ctx_t ev = {.event = app::EVENT_LINK_RESET, .size = uint16_t(fd)};
+    // The generation, not the fd, rides in the event: lwIP reuses a closed
+    // fd number at once, so an event for a host already gone would match the
+    // next connection. Only the server task posts these, never the app task
+    // that drains the queue, so waiting for room cannot deadlock.
+    app::ctx_t ev = {.event = app::EVENT_LINK_RESET, .size = gen};
     while (app::send_event(ev) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI(TAG, "host connected");
 }
 
-void transport::on_link_reset_int(int fd) {
-    {
+void transport::on_link_reset_int(uint16_t gen) {
+    protocol::reset_link_state([&]() {
         utils::sem_lock l(m_client_sem);
-        if (m_switching != fd) {
-            return;
+        if (gen != m_switching_gen) {
+            return false;   // gone or replaced before its turn
         }
-        // Frames queued from here on were stamped for the previous host.
-        m_client.store(-1, std::memory_order_relaxed);
-    }
-    // The new host's sequence numbers start at 0, so ours restart as after a
-    // boot.
-    protocol::reset_link_state();
-    {
-        utils::sem_lock l(m_client_sem);
-        if (m_switching != fd) {
-            return;
+        // No frame can be stamped while protocol holds m_tx_sem, so what
+        // m_input_buf holds now is exactly what was stamped for the previous
+        // host.
+        {
+            utils::sem_lock in(m_input_sem);
+            m_discard = xStreamBufferBytesAvailable(m_input_buf);
         }
-        send_direct(fd, BOOT_ACK, sizeof(BOOT_ACK));
-        // Before the stack has loaded its NVRAM the boot-ready frame would let
-        // the host read default PAN values and form a new network over the
-        // stored one (andryblack/esp-coordinator#5); on_boot_ready sends it
-        // once the dataset is loaded.
-        if (m_boot_ready) {
-            size_t n = 0;
-            const uint8_t* frame = zb_ncp::boot_ready_frame(&n);
-            send_direct(fd, frame, n);
-        }
-    }
-    // Behind everything already queued, so all of that is dropped, and ahead
-    // of anything the new host's first request produces.
-    app::ctx_t ev = {.event = app::EVENT_LINK_ACTIVE, .size = uint16_t(fd)};
-    while (app::send_event(ev) != ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+        m_client.store(m_switching.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_switching.store(-1, std::memory_order_relaxed);
+        m_switching_gen = 0;
+        return true;
+    });
 }
 
-void transport::on_link_active_int(int fd) {
+void transport::poll_boot_ready_int() {
+    if (!m_boot_ready_req.load(std::memory_order_relaxed)) {
+        return;
+    }
     utils::sem_lock l(m_client_sem);
-    if (m_switching == fd) {
-        m_client.store(fd, std::memory_order_relaxed);
-        m_switching = -1;
+    if (m_boot_ready) {
+        return;
     }
-}
-
-void transport::on_boot_ready_int() {
     m_boot_ready = true;
-    utils::sem_lock l(m_client_sem);
     size_t n = 0;
     const uint8_t* frame = zb_ncp::boot_ready_frame(&n);
-    const int fd = m_client.load(std::memory_order_relaxed);
-    if (fd >= 0) {
-        send_direct(fd, frame, n);
-    }
-    // A host still between reset and active has had its boot frames already,
-    // without this one: it goes to that socket now.
-    if (m_switching >= 0) {
-        send_direct(m_switching, frame, n);
+    // Whichever slot holds a connection has had BOOT_ACK and not this.
+    for (int fd : {m_client.load(), m_switching.load(), m_candidate}) {
+        if (fd >= 0) {
+            send_all(fd, frame, n);
+        }
     }
 }
 
@@ -252,6 +257,20 @@ static int find_signature(const uint8_t* buf, int len, bool& pending_de) {
     return -2;
 }
 
+// recv that never blocks: select's readiness bits can be stale for a socket
+// closed and reused within the same pass. 0 = nothing to read now, -1 = the
+// connection ended.
+static int recv_now(int fd, uint8_t* buf, size_t size) {
+    int n = ::recv(fd, buf, size, MSG_DONTWAIT);
+    if (n > 0) {
+        return n;
+    }
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    return -1;
+}
+
 void transport::task_int() {
     m_listen = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_listen < 0) {
@@ -275,8 +294,8 @@ void transport::task_int() {
     }
     ESP_LOGI(TAG, "NCP listening on tcp :%d", CONFIG_ZBOSS_NCP_TCP_PORT);
 
-    int host = -1;           // the host, promoted
-    int cand = -1;           // a second connection that has not sent DE AD yet
+    int host = -1;           // promoted: switching, then routed
+    int cand = -1;           // sent the boot frames, no ZBOSS frame from it yet
     bool cand_de = false;
     int64_t cand_since = 0;
     while (true) {
@@ -292,53 +311,38 @@ void transport::task_int() {
         }
         struct timeval tv = {};
         tv.tv_sec = 1;
-        int ready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
-        if (ready < 0) {
+        if (::select(maxfd + 1, &rfds, nullptr, nullptr, &tv) < 0) {
             if (errno != EINTR) vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        if (cand >= 0 && esp_timer_get_time() - cand_since > QUALIFY_TIMEOUT_US) {
-            ESP_LOGW(TAG, "second connection sent no ZBOSS frame, dropped");
-            ::close(cand);
-            cand = -1;
-        }
-
-        if (FD_ISSET(m_listen, &rfds)) {
-            int fd = ::accept(m_listen, nullptr, nullptr);
-            if (fd >= 0) {
-                set_client_options(fd);
-                if (host < 0) {
-                    // Nobody to protect: a host that connects to an idle
-                    // coordinator is the host.
-                    host = fd;
-                    promote(host);
-                } else {
-                    if (cand >= 0) {
-                        ::close(cand);
-                    }
-                    cand = fd;
-                    cand_de = false;
-                    cand_since = esp_timer_get_time();
-                }
+        if (host >= 0 && FD_ISSET(host, &rfds)) {
+            int n = recv_now(host, m_temp_buf, BUF_SIZE);
+            if (n > 0) {
+                rx_pump(m_temp_buf, n);
+            } else if (n < 0) {
+                ESP_LOGW(TAG, "host disconnected");
+                drop_fd(host);
+                host = -1;
             }
         }
 
         if (cand >= 0 && FD_ISSET(cand, &rfds)) {
-            int n = ::recv(cand, m_temp_buf, BUF_SIZE, 0);
-            if (n <= 0 && !(n < 0 && (errno == EINTR || errno == EAGAIN))) {
-                ::close(cand);
+            int n = recv_now(cand, m_temp_buf, BUF_SIZE);
+            if (n < 0) {
+                drop_fd(cand);
                 cand = -1;
             } else if (n > 0) {
                 int sig = find_signature(m_temp_buf, n, cand_de);
                 if (sig != -2) {
-                    // A real host: a ZBOSS host reconnecting from a session
-                    // this end still holds, half open, takes over now instead
-                    // of after the keepalive gives up on the old one.
-                    ESP_LOGW(TAG, "new host replaces the connected one");
-                    drop_fd(host);
+                    if (host >= 0) {
+                        ESP_LOGW(TAG, "new host replaces the connected one");
+                        drop_fd(host);
+                    }
                     host = cand;
                     cand = -1;
+                    // Posted before the bytes below, so the reset runs ahead
+                    // of the new host's first request.
                     promote(host);
                     if (sig == -1) {
                         const uint8_t de = 0xDE;
@@ -351,20 +355,23 @@ void transport::task_int() {
             }
         }
 
-        if (host >= 0 && FD_ISSET(host, &rfds)) {
-            int n = ::recv(host, m_temp_buf, BUF_SIZE, 0);
-            if (n > 0) {
-                rx_pump(m_temp_buf, n);
-            } else if (!(n < 0 && (errno == EINTR || errno == EAGAIN))) {
-                ESP_LOGW(TAG, "host disconnected");
-                drop_fd(host);
-                host = -1;
-                // A connection that waited for the slot has it now.
-                if (cand >= 0) {
-                    host = cand;
-                    cand = -1;
-                    promote(host);
-                }
+        if (cand >= 0 && esp_timer_get_time() - cand_since > QUALIFY_TIMEOUT_US) {
+            ESP_LOGW(TAG, "connection sent no ZBOSS frame in %llds, dropped",
+                     QUALIFY_TIMEOUT_US / 1000000);
+            drop_fd(cand);
+            cand = -1;
+        }
+
+        if (FD_ISSET(m_listen, &rfds)) {
+            int fd = ::accept(m_listen, nullptr, nullptr);
+            if (fd >= 0) {
+                set_client_options(fd);
+                // One waiting connection: the latest is the likelier host.
+                drop_fd(cand);
+                cand = fd;
+                cand_de = false;
+                cand_since = esp_timer_get_time();
+                add_candidate(fd);
             }
         }
     }
@@ -397,6 +404,13 @@ esp_err_t transport::process_input_int(void* buffer, size_t size) {
 		ESP_LOGE(TAG, "Input buffer receive error: got %u expect %u!",
 		         unsigned(got), unsigned(size));
 		return ESP_FAIL;
+	}
+	if (m_discard > 0) {
+		// Stamped for a host that is gone: its sequence numbers would
+		// confuse the new one. Frames leave the buffer whole, one event each,
+		// so the count lands on a frame boundary.
+		m_discard = (m_discard > size) ? m_discard - size : 0;
+		return ESP_OK;
 	}
 	return write_int(buffer, size);
 }

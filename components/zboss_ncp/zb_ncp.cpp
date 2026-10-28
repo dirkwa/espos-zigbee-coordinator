@@ -562,9 +562,11 @@ const uint8_t* zb_ncp::boot_ready_frame(size_t* size) {
 }
 
 void zb_ncp::send_boot_ready_frame() {
-    // Through the app task rather than straight into the transport queue:
-    // there it is ordered against hosts connecting, so a host that connects
-    // around this moment gets the frame exactly once (transport::on_boot_ready).
+    // Sent by the app task rather than queued here: there it is ordered
+    // against hosts connecting, so each gets the frame exactly once. The
+    // event only wakes the app task; if the queue is full it finds the
+    // request on its next pass.
+    transport::request_boot_ready();
     app::ctx_t ev = {.event = app::EVENT_BOOT_READY, .size = 0};
     app::send_event(ev);
 }

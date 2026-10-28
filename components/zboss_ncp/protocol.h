@@ -60,7 +60,9 @@ private:
 	void send_ack(const ncp_header_t& hdr);
 	void send_nack(const ncp_header_t& hdr);
 	esp_err_t send_data_int(const void* data,size_t size);
-	void reset_link_state_int();
+	void reset_link_state_locked();
+	void lock_tx();
+	void unlock_tx();
 	
 public:
 	// Largest single frame the protocol layer ever hands to transport::send
@@ -81,6 +83,17 @@ public:
 	}
 	// Back to the state after a boot, for a host that has just connected:
 	// its sequence numbers restart at 0 and it has seen none of ours. App
-	// task only, like on_rx.
-	static void reset_link_state() { instance().reset_link_state_int(); }
+	// task only, like on_rx. `cut` runs first with m_tx_sem held, so no frame
+	// is stamped while it runs: everything transport holds at that point was
+	// stamped for the previous host. The reset happens only when it returns
+	// true.
+	template <typename F>
+	static void reset_link_state(F&& cut) {
+		protocol& p = instance();
+		p.lock_tx();
+		if (cut()) {
+			p.reset_link_state_locked();
+		}
+		p.unlock_tx();
+	}
 };

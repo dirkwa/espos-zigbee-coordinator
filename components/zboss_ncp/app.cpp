@@ -105,11 +105,8 @@ esp_err_t app::process_event(const ctx_t& ctx) {
         case EVENT_LINK_RESET:
             transport::on_link_reset(ctx.size);
             break;
-        case EVENT_LINK_ACTIVE:
-            transport::on_link_active(ctx.size);
-            break;
         case EVENT_BOOT_READY:
-            transport::on_boot_ready();
+            transport::poll_boot_ready();
             break;
         default:
             break;
@@ -215,6 +212,7 @@ void app::run() {
             }
         }
         zb_ncp::request_watchdog_tick();
+        transport::poll_boot_ready();
     }
 }
 

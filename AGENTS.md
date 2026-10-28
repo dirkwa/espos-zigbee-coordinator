@@ -22,8 +22,11 @@ the NCP is `components/zboss_ncp`, vendored from busware's esp-coordinator
 - **Changes to `components/zboss_ncp` stay close to upstream.** Fix protocol
   bugs upstream as well, note every local change in `UPSTREAM.md`, and keep
   upstream's comments where the code is upstream's.
-- **One host at a time.** The NCP has one link state; a new connection
-  replaces the old one and is switched in on the app task.
+- **One host at a time.** The NCP has one link state. A connection becomes
+  the host only once it sends a ZBOSS frame, and the switch happens on the
+  app task, where the link reset, the route change and dropping the previous
+  host's frames are one step (`transport.h` has the sequence). Do not let a
+  bare connect replace a live host.
 - **Partition tables are fixed at the first USB flash.** OTA never rewrites
   them, so a change reaches only newly flashed boards. The coordinator's
   partitions are the same size in every table.

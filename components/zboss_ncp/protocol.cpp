@@ -266,8 +266,15 @@ esp_err_t protocol::on_rx_int(const void* data,size_t size) {
 
 
 
-void protocol::reset_link_state_int() {
-	utils::sem_lock l(m_tx_sem);
+void protocol::lock_tx() {
+	xSemaphoreTake(m_tx_sem, portMAX_DELAY);
+}
+
+void protocol::unlock_tx() {
+	xSemaphoreGive(m_tx_sem);
+}
+
+void protocol::reset_link_state_locked() {
 	m_rx_buffer_pos = 0;
 	m_tx_seq = 1;
 	m_last_rx_seq = 0;
