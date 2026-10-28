@@ -1,0 +1,21 @@
+# espos-zigbee-coordinator partition table, 8 MB flash: espOS's
+# 8mb.csv unchanged, plus the coordinator's three partitions in the 64 KB
+# espOS leaves free at the end. They are the same size in every table.
+#   zb_nvs      the NCP's own NVS (upstream's "nvs", 24 KB): a network backup
+#               exports it and a restore writes it, so it must never be the
+#               "nvs" that holds this device's Wi-Fi, token and keys
+#   zb_storage  the ZBOSS network NVRAM (keys, PAN, frame counters, devices)
+#   zb_fct      ZBOSS factory data
+# A device keeps the table it was first flashed with, so this reaches only
+# boards flashed over USB.
+nvs,        data, nvs,      ,        128K,
+otadata,    data, ota,      ,        8K,
+phy_init,   data, phy,      ,        4K,
+nvs_keys,   data, nvs_keys, ,        4K,    encrypted
+coredump,   data, coredump, ,        64K,
+ota_0,      app,  ota_0,    ,        3M,
+ota_1,      app,  ota_1,    ,        3M,
+storage,    data, littlefs, ,        1728K,
+zb_nvs,     data, nvs,      ,        24K,
+zb_storage, data, fat,      ,        16K,
+zb_fct,     data, fat,      ,        1K,

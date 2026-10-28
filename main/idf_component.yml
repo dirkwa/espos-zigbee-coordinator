@@ -1,0 +1,4 @@
+## espos-zigbee-coordinator app manifest. espOS pins its own registry
+## dependencies, and components/zboss_ncp pins the Zigbee stack.
+dependencies:
+  idf: ">=6.0.0"

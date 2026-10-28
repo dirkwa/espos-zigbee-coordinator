@@ -1,0 +1,15 @@
+build/
+build-*/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Never commit the OTA signing key. Losing it means no device takes an OTA
+# again; leaking it means anyone can sign firmware for your devices.
+secure_boot_signing_key.pem
+*.pem
+
+# Local credential/build overrides.
+sdkconfig.local
+secrets.h

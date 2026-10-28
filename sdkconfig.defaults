@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Dirk Wahrheit
+# SPDX-License-Identifier: Apache-2.0
+#
+# Only what differs from espOS. espos/cmake/espos_project.cmake puts
+# espos/sdkconfig.d/espos.defaults (+ .<target>) on SDKCONFIG_DEFAULTS ahead
+# of this file, so flash/OTA/signing, logging, the HTTP server and the task
+# stacks are inherited and a line here is an override, never a mirror.
+# Defaults reach a FRESH sdkconfig only: delete build*/sdkconfig after
+# changing anything here or in espOS's fragments.
+
+# A coordinator on the chip's own 802.15.4 radio.
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+CONFIG_ZB_RADIO_NATIVE=y
+# Wi-Fi and 802.15.4 share one 2.4 GHz radio; without the software
+# coexistence arbiter one of them starves the other.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+# The NCP server rebinds its port after every restart.
+CONFIG_LWIP_SO_REUSE=y

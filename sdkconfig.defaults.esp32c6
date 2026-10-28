@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Dirk Wahrheit
+# SPDX-License-Identifier: Apache-2.0
+#
+# The flash size of partitions/8mb.csv, which CMakeLists.txt picks for this
+# chip; a bundled espOS table would set it itself.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y

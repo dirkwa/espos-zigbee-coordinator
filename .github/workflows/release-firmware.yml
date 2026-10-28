@@ -1,0 +1,434 @@
+# SPDX-FileCopyrightText: 2026 Dirk Wahrheit
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build and release the Zigbee coordinator for every chip it supports.
+#
+# The per-target build is espOS's reusable build-firmware.yml rather than a
+# local copy: two consumers had already grown their own copies of that job and
+# they had drifted, which is the whole reason the reusable one exists. It needed
+# `tag` and `artifact` inputs to be callable this way (signalk-espOS/espOS#121).
+#
+# One release job for all targets, not one per leg: parallel releases on
+# one tag would race each other, and only an aggregate can attach every
+# target's assets to the same tag.
+name: Build & release firmware
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "The release tag to build, sign and attach assets to"
+        type: string
+        required: true
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to build and attach assets to. Required: without
+          it the reusable workflow sees an empty tag, skips restoring the
+          signing key, stages nothing, and the release job below is skipped --
+          a manual run that appears to succeed and produces nothing.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    strategy:
+      # One board per chip, so a chip failing to build should still yield the
+      # others rather than leaving a release with no assets. The release job
+      # below still requires them all, so a partial build does not ship.
+      fail-fast: false
+      matrix:
+        # The chips with an 802.15.4 radio beside their Wi-Fi. The image is
+        # past the 1.7 MB slots of a 4 MB table, so the C6 builds on the 8 MB
+        # one and adds a 16 MB image from the same build (dev kits are sold
+        # with either); the C5 kit carries 16 MB. Both use this project's
+        # tables, which add the coordinator's partitions to espOS's.
+        include:
+          - target: esp32c5
+          - target: esp32c6
+            flash_tables: "8mb=partitions/8mb.csv 16mb=partitions/16mb.csv"
+    # @main, matching what espOS documents for this workflow (docs/releasing.md
+    # and the workflow's own header). Every THIRD-PARTY action in this repo is
+    # SHA-pinned, and that asymmetry is deliberate:
+    #
+    #   - signalk-espOS/espOS has one collaborator, the same person who holds
+    #     this repository's signing key. A SHA would only guard against someone
+    #     who can push to espOS main -- and anyone who can do that can already
+    #     use the key directly, so it buys nothing here that is not already
+    #     lost. The forwarded signing_key does not change that.
+    #   - The espOS SUBMODULE is pinned to a tag independently, so what gets
+    #     compiled is fixed; only the build recipe floats.
+    #   - A shared workflow exists so a fix reaches every consumer. Pinning a
+    #     SHA per consumer reintroduces exactly the drift it was written to
+    #     remove -- two consumers had already grown divergent copies once.
+    #
+    # Revisit if espOS gains collaborators who should not be able to sign this
+    # firmware, or if it starts tagging the workflow separately.
+    uses: signalk-espOS/espOS/.github/workflows/build-firmware.yml@main
+    with:
+      target: ${{ matrix.target }}
+      # The chip is in the name because these images are NOT interchangeable
+      # and a device cannot tell them apart: espOS matches an update on app,
+      # target and channel.
+      name: zigbee-coordinator-${{ matrix.target }}
+      tag: ${{ inputs.tag || github.event.release.tag_name }}
+      # Distinct per leg: two legs uploading one artifact name is an error on
+      # upload-artifact v4+.
+      artifact: firmware-${{ matrix.target }}
+      flash_tables: ${{ matrix.flash_tables || '' }}
+    secrets:
+      # The repository secret by its own name, rather than declaring it under
+      # this file's own `workflow_call.secrets`. That keeps the secret's name in
+      # one place, but it has a consequence worth stating, because getting it
+      # wrong yields unsigned firmware and no error anywhere:
+      #
+      # on the `release:` and `workflow_dispatch:` triggers the repository
+      # secret is visible here directly, but on `workflow_call:` this file is a
+      # CALLED workflow, and a called workflow receives no secrets unless its
+      # caller forwards them. release-please.yml reaches this file on exactly
+      # that trigger, so its `secrets: inherit` is what makes the key readable
+      # here. It is load-bearing, not redundant -- without it the build falls
+      # back to a per-run throwaway key, succeeds, and produces a release that
+      # installs over USB and then refuses every OTA.
+      signing_key: ${{ secrets.ZIGBEE_COORDINATOR_SIGNING_KEY_PEM }}
+      # Docker Hub login for the ESP-IDF image pull, so a release does not fail
+      # on the anonymous rate limit. Both optional: without them the pull is
+      # anonymous. The username is a repository variable, the token a secret.
+      dockerhub_username: ${{ vars.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release:
+    needs: firmware
+    runs-on: ubuntu-latest
+    if: inputs.tag != '' || github.event_name == 'release'
+    permissions:
+      contents: write
+    # Serialised across ALL tags, deliberately not keyed by tag. The mirror
+    # step is a fetch-modify-force-push of one shared branch, so two runs for
+    # DIFFERENT tags are exactly the pair that can lose data: both read the
+    # branch, each adds its own directory, and the second push discards the
+    # first one's. Keying by tag would permit precisely that.
+    #
+    # Know the limit of this, because it is not a queue: GitHub keeps at most
+    # ONE pending run per concurrency group, so with three runs in flight the
+    # middle one is cancelled rather than waiting its turn, and that release
+    # gets no assets and no mirror. `cancel-in-progress: false` only protects
+    # the run already executing. Two concurrent releases are safe, which is the
+    # realistic case here -- releases are rare and the job takes minutes -- but
+    # a burst of three needs the skipped tag re-run by hand
+    # (workflow_dispatch), and the tag-exists check below makes that safe to do.
+    concurrency:
+      group: release-assets-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          # Every leg's artifact, merged into one dist/ for a single release.
+          pattern: firmware-*
+          merge-multiple: true
+          path: dist
+
+      - name: list what will be attached
+        run: ls -l dist/
+
+      # Before publishing anything. raw.githubusercontent cannot serve a file
+      # this large, so the browser-readable mirror would 404 -- and once the
+      # release exists the registry indexes it and offers owners of that chip a
+      # download that fails. Failing here leaves no half-published release.
+      # The mirror lays the branch out as <tag>/<asset> and prunes by top-level
+      # directory name, so a tag containing a slash would nest, escape both the
+      # TAG comparison and the pruning, and publish URLs under a path nothing
+      # retains. release-please cannot emit one (include-component-in-tag is
+      # false) but the workflow_dispatch input is free text, so reject it here
+      # rather than making the layout cope with a tag shape this project does
+      # not use.
+      - name: refuse a tag the mirror cannot lay out
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            "" )
+              echo "::error::no tag to publish"; exit 1 ;;
+            */* | . | .. | -* )
+              echo "::error::tag '$TAG' cannot be a directory name on the" \
+                   "release-assets branch. Use a flat tag such as v1.2.3."
+              exit 1 ;;
+          esac
+          echo "tag '$TAG' is usable as a directory name"
+
+          # And it must name a release that exists. The mirror runs before the
+          # release step (so a release is never published without a
+          # browser-readable copy), which means a mistyped workflow_dispatch tag
+          # would otherwise mutate the shared branch -- and prune a real
+          # release's images to make room -- for a release that was never going
+          # to exist. On the `release:` trigger this is already true by
+          # construction; the check costs one API call and covers the manual
+          # path.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::no release '$TAG' in ${REPO}. Create the release" \
+                 "first, or re-run for a tag that exists."
+            exit 1
+          fi
+          echo "release '$TAG' exists"
+
+      - name: refuse an image too large to mirror
+        run: |
+          set -euo pipefail
+          for f in dist/*.bin; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt 52428800 ]; then
+              echo "::error::$(basename "$f") is $size bytes; too large to serve" \
+                   "from raw.githubusercontent. The flasher would 404."
+              exit 1
+            fi
+          done
+          echo "all images are within the size raw.githubusercontent serves"
+
+      # Publish the same images somewhere a BROWSER may read them.
+      #
+      # GitHub serves release downloads with no Access-Control-Allow-Origin, on
+      # the 302 and on the redirect target, so a web page cannot fetch them at
+      # all -- the hosted flasher could never download firmware from a release.
+      # raw.githubusercontent does send `access-control-allow-origin: *` and
+      # honours Range requests, so an orphan branch of this repository works as
+      # a CORS-readable mirror of what the release already carries.
+      #
+      # The branch is a publishing surface, not history: it carries one
+      # directory per tag and is rewritten as a single commit each time, so it
+      # never accumulates history even though it keeps several releases.
+      #
+      # It KEEPS older tags rather than holding only the newest, because this
+      # job can run for an old tag at any time -- `workflow_dispatch` takes a
+      # tag -- and a run that published only its own tag would delete a newer
+      # release's images. Publishing is
+      # therefore additive, and the oldest are pruned below so the branch stays
+      # bounded.
+      - name: mirror the images where a browser can read them
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          work=$(mktemp -d)
+          staged=$PWD/dist
+
+          remote="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+
+          # Start from what the branch already holds, so this run adds its own
+          # tag instead of replacing everyone else's. A missing branch (the
+          # first release) is the only case where there is nothing to fetch.
+          cd "$work"
+          git init -q -b release-assets
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Tell "the branch does not exist yet" apart from "the fetch
+          # failed". The first is the normal first release; the second means
+          # force-pushing over content we could not read, which is how a
+          # transient network or auth error deletes every other release's
+          # images. Neither the fetch nor the checkout may fail quietly.
+          # Only exit 2 means "no such branch"; 128 means the remote could not
+          # be reached at all. Treating those alike is how an auth or network
+          # failure force-pushes an empty branch over every release's images.
+          set +e
+          git ls-remote --exit-code --heads "$remote" release-assets >/dev/null 2>&1
+          lsr=$?
+          set -e
+          case "$lsr" in
+            0)
+              echo "release-assets exists; restoring it before adding $TAG"
+              git fetch -q --depth 1 "$remote" release-assets
+              git checkout -q FETCH_HEAD -- .
+              echo "existing tags on the branch:"
+              find . -mindepth 1 -maxdepth 1 -type d -not -name '.*' \
+                -printf '  %f\n' | sort -V
+              # Keep the branch exactly as it was, so a later failure to attach
+              # the release assets can put it back rather than leaving the
+              # mirror advertising images the release does not have.
+              snapshot="${RUNNER_TEMP}/release-assets-before"
+              rm -rf "$snapshot"
+              git clone -q --depth 1 --branch release-assets \
+                "$remote" "$snapshot" 2>/dev/null \
+                || echo "::warning::could not snapshot release-assets; no rollback will be possible"
+              ;;
+            2)
+              echo "release-assets does not exist yet; creating it"
+              # Record that there was nothing here before, so a rollback deletes
+              # the branch this run creates rather than warning about a snapshot
+              # that could never have existed.
+              touch "${RUNNER_TEMP}/release-assets-was-absent"
+              ;;
+            *)
+              echo "::error::could not reach ${REPO} to read release-assets" \
+                   "(git ls-remote exited $lsr). Refusing to publish, because" \
+                   "force-pushing now would delete the other releases' images."
+              exit 1
+              ;;
+          esac
+
+          # After the restore above, which brings back the previous run's
+          # README naming the previous tag.
+          {
+            echo "# Browser-readable firmware"
+            echo
+            echo "Generated by \`release-firmware.yml\`; do not edit or merge."
+            echo
+            echo "These are the same images attached to release \`$TAG\`,"
+            echo "republished here because GitHub serves release downloads"
+            echo "without the CORS header a web page needs to read them. The"
+            echo "hosted flasher fetches them from raw.githubusercontent.com,"
+            echo "which does send it."
+            echo
+            echo "Force-pushed on every release; holds up to five releases,"
+            echo "always the one just published. The releases remain the archive."
+          } > "$work/README.md"
+
+          # Re-stage this tag's images over whatever was there, so re-running a
+          # release replaces its own directory and leaves the others alone.
+          rm -rf -- "${TAG:?}"
+          mkdir -p "$TAG"
+          cp "$staged"/*.bin "$TAG/"
+
+          # Keep the branch bounded. Old firmware stays downloadable from its
+          # release; only the browser-readable copy is pruned.
+          # Keep the newest KEEP, and ALWAYS keep the tag this run publishes.
+          # Without that exception, re-publishing an old tag while KEEP newer
+          # ones already exist prunes the directory just written, and the step
+          # then reports success with URLs that 404. Reproduced with v0.1.0
+          # behind five newer tags.
+          #
+          # Sorted by version, not lexically, or v0.10.0 would prune before
+          # v0.6.0.
+          KEEP=5
+          mapfile -t others < <(
+            find . -mindepth 1 -maxdepth 1 -type d -not -name '.*' -printf '%f\n' \
+              | grep -Fxv -- "$TAG" | sort -rV
+          )
+          # One slot belongs to $TAG, so keep KEEP-1 of the others.
+          for old in "${others[@]:$((KEEP - 1))}"; do
+            echo "pruning $old"
+            rm -rf -- "$old"
+          done
+
+          # One commit, no history: --force replaces the branch wholesale, and
+          # what it contains is everything above rather than this tag alone.
+          git add -A
+          git commit -q -m "firmware for $TAG"
+          git push -q --force "$remote" release-assets
+
+          echo "published $TAG to the release-assets branch:"
+          for f in "$TAG"/*.bin; do
+            echo "  https://raw.githubusercontent.com/${REPO}/release-assets/${TAG}/$(basename "$f")"
+          done
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          # Named explicitly: on a workflow_call there is no release event.
+          tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+          # Fail rather than publish a release missing a chip's firmware: a
+          # silently incomplete release is worse than a failed one, because the
+          # registry would index it and offer owners of that chip nothing.
+          fail_on_unmatched_files: true
+          files: dist/*.bin
+
+      # If attaching the assets fails after the mirror has published, the
+      # branch advertises images for a release that has none. Roll the mirror
+      # back to what it held before this run, so the two never disagree. It
+      # re-pushes the snapshot taken before the mirror step, which is why that
+      # step records one.
+      #
+      # Any failure after the mirror pushed, not only a failed attach. The
+      # narrower `steps.attach.outcome == 'failure'` missed the case it most
+      # needed to catch: if the mirror step pushes and then fails on a later
+      # line, `attach` is SKIPPED rather than failed, so the branch was left
+      # advertising a tag whose release has no assets -- exactly the state this
+      # step exists to undo.
+      #
+      # Safe to widen because this is the last step and the restore is guarded:
+      # a failure before the mirror ran leaves neither snapshot nor
+      # was-absent marker, so it warns and exits 0 without touching anything.
+      - name: roll the mirror back if anything after it failed
+        if: failure()
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          snapshot="${RUNNER_TEMP}/release-assets-before"
+
+          # The branch did not exist before this run, so "restoring" it means
+          # removing what this run created.
+          if [ -f "${RUNNER_TEMP}/release-assets-was-absent" ]; then
+            echo "release-assets did not exist before this run; deleting it"
+            git push -q --delete "$remote" release-assets \
+              || echo "::warning::could not delete release-assets"
+            exit 0
+          fi
+
+          if [ ! -d "$snapshot/.git" ]; then
+            echo "::warning::no pre-mirror snapshot to restore; the" \
+                 "release-assets branch may advertise $TAG with no assets" \
+                 "attached to the release."
+            exit 0
+          fi
+          cd "$snapshot"
+          git push -q --force "$remote" release-assets
+          echo "release-assets restored to its state before this run"
+
+  # The registry indexes new releases on a schedule, and GitHub runs scheduled
+  # workflows late or drops them under load, so a release could sit unseen for
+  # hours with the Signal K manager telling boats they were up to date. Asking
+  # the registry to reindex once the assets are attached shows it in minutes.
+  # Its schedule remains the fallback, so this job only ever warns: the release
+  # itself is already complete when it runs.
+  notify-registry:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      # A flag, because a step's `if` cannot read secrets.
+      APP_CONFIGURED: >-
+        ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+    steps:
+      # The same App that opens the espOS tracking PRs, with a token for the
+      # registry alone. It needs access to signalk-espOS/registry, granted in
+      # the App's installation on that organisation.
+      - name: Get a token for the registry
+        id: token
+        if: env.APP_CONFIGURED == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # The Client ID is public (the App's settings page shows it), so it
+          # lives here; only the private key is a secret.
+          client-id: Iv23liXbDO1OUUwlQoNc
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: signalk-espOS
+          repositories: registry
+          permission-contents: write
+
+      - name: Ask the registry to reindex
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::no token for signalk-espOS/registry; its hourly" \
+                 "reindex will pick this release up instead"
+            exit 0
+          fi
+          gh api -X POST repos/signalk-espOS/registry/dispatches \
+            -f event_type=firmware-released \
+            || echo "::warning::the registry refused the reindex request; its" \
+                    "hourly reindex will pick this release up instead"

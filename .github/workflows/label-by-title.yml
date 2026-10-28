@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: 2026 Dirk Wahrheit
+# SPDX-License-Identifier: Apache-2.0
+#
+# Labels each pull request from its Conventional Commit title, because
+# .github/release.yml sorts the release notes by label and a pull request
+# opened from the command line carries none. The mapping is espOS's: feat ->
+# Added, fix and revert -> Fixed, perf and refactor -> Changed, while docs,
+# build, ci, test and chore stay out of the notes. A breaking change -- `!` after the type, or a `BREAKING CHANGE:`
+# line in the description, which becomes the squash commit's body -- goes
+# under Breaking whatever its type.
+#
+# pull_request, not pull_request_target, which GitHub blocks on public
+# repositories by default from 2026-11-02. A fork's pull request gets a
+# read-only token that cannot label, so the job skips it and a maintainer sets
+# the label by hand.
+name: label by title
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+permissions: {}
+
+jobs:
+  label:
+    name: label from the title
+    # `edited` also fires for a base-branch change, which leaves the labels
+    # alone.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'edited' || github.event.changes.title || github.event.changes.body)
+    # One run per pull request at a time: two overlapping runs would each read
+    # the labels, then each edit, and could leave two managed labels behind.
+    # Set on the job, after the condition above, so that a run the condition
+    # skips cannot cancel one that edits.
+    concurrency:
+      group: label-by-title-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The issues labels endpoint, which serves pull requests too, takes
+    # issues: write; pull-requests: write alone is not documented for it.
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # The labels this workflow owns, one of them at a time, so a title
+          # edited from feat to fix swaps the label rather than adding one. A
+          # type not listed gets none of them and lands under Other.
+          managed="breaking-change enhancement bug changed skip-changelog"
+          conventional='^([a-z]+)(\([^)]*\))?(!?): '
+          type=""; bang=""
+          if [[ "$TITLE" =~ $conventional ]]; then
+            type="${BASH_REMATCH[1]}"; bang="${BASH_REMATCH[3]}"
+          fi
+          case "$type" in
+            feat) wanted=enhancement ;;
+            fix|revert) wanted=bug ;;
+            perf|refactor) wanted=changed ;;
+            docs|build|ci|test|chore) wanted=skip-changelog ;;
+            *) wanted="" ;;
+          esac
+          if [ -n "$bang" ] || grep -qE '^BREAKING[ -]CHANGE: ' <<< "$BODY"; then
+            wanted=breaking-change
+          fi
+          # The REST labels endpoints rather than gh pr edit, which reads the
+          # pull request's project cards first and fails on a project-linked
+          # one with this token.
+          current=$(gh api "repos/$REPO/issues/$NUMBER/labels" --jq '[.[].name] | join(" ")')
+          add=(); remove=()
+          for label in $managed; do
+            case " $current " in *" $label "*) has=1 ;; *) has=0 ;; esac
+            if [ "$label" = "$wanted" ] && [ "$has" = 0 ]; then add+=("$label"); fi
+            if [ "$label" != "$wanted" ] && [ "$has" = 1 ]; then remove+=("$label"); fi
+          done
+          if [ "${#add[@]}" = 0 ] && [ "${#remove[@]}" = 0 ]; then
+            echo "#$NUMBER '$TITLE': nothing to change (${wanted:-no managed label})"
+            exit 0
+          fi
+          for label in "${add[@]}"; do
+            gh api -X POST "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=$label" > /dev/null
+          done
+          for label in "${remove[@]}"; do
+            gh api -X DELETE "repos/$REPO/issues/$NUMBER/labels/$label" > /dev/null
+          done
+          echo "#$NUMBER '$TITLE': added ${add[*]:-nothing}, removed ${remove[*]:-nothing}"
