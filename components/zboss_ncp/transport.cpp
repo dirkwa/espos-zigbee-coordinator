@@ -211,12 +211,15 @@ bool transport::promote(int fd) {
     // The host's bytes go in only once its reset has run: before it, they
     // would sit among the previous host's in m_output_buf, where the reset
     // could not tell the two apart.
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(LINK_RESET_WAIT_MS);
+    // Elapsed ticks, not a deadline, so a tick count wrap cannot end the
+    // wait early.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t wait = pdMS_TO_TICKS(LINK_RESET_WAIT_MS);
     uint32_t done = 0;
     while (true) {
-        const TickType_t now = xTaskGetTickCount();
-        if (now >= deadline ||
-            xQueueReceive(m_reset_done, &done, deadline - now) != pdTRUE) {
+        const TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= wait ||
+            xQueueReceive(m_reset_done, &done, wait - elapsed) != pdTRUE) {
             ESP_LOGE(TAG, "link reset did not run, dropping the new host");
             return false;
         }
