@@ -1,31 +1,27 @@
 #include "transport.h"
 #include "app.h"
+#include "protocol.h"
 #include "utils.h"
+#include "zb_ncp.h"
 
 #include <esp_log.h>
-#include "sdkconfig.h"
-
-#include <driver/usb_serial_jtag.h>
-#if CONFIG_NCP_UART_TRANSPORT
-#include <driver/uart.h>
-#include <driver/gpio.h>
-#endif
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <lwip/sockets.h>
+#include <cerrno>
 #include <cstring>
 
 static const char* TAG = "TRNPT";
 
-#if CONFIG_NCP_UART_TRANSPORT
-// UART1 fixed: UART0 is the (silent) primary console and carries the ROM
-// bootloader's reset banner on GPIO16/17 — routing the NCP stream there would
-// inject garbage into the host parser on every reset. UART1 has no IOMUX
-// binding on the C6; the Kconfig pins go through the GPIO matrix.
-static constexpr uart_port_t NCP_UART_PORT = UART_NUM_1;
-// uart_write_bytes enqueues an event item plus data item(s) into a NOSPLIT
-// ring buffer (8-byte header per item) and busy-spins when the ring is full.
-// The free-size gate in write_int keeps a margin for those overheads so the
-// call is only made when the whole frame fits without blocking.
-static constexpr size_t UART_TX_ITEM_MARGIN = 32;
-#endif
+// SO_SNDTIMEO bounds each ::send, but lwIP restarts that clock whenever a
+// partial send makes progress, so a link that trickles would hold the app
+// task far longer. This is the bound for one whole frame.
+static constexpr uint32_t TCP_FRAME_DEADLINE_MS = 12000;
+
+// The framing-level ACK herdsman's open-port handshake waits for
+// (andryblack/esp-coordinator#11). A host connects whenever it likes and may
+// reconnect, so every accepted client gets it, not only the first.
+static const uint8_t BOOT_ACK[] = {0xDE, 0xAD, 0x05, 0x00, 0x06, 0x01, 0x8F};
 
 transport::transport() {}
 
@@ -36,60 +32,35 @@ transport& transport::instance() {
 
 esp_err_t transport::write_int(const void *buffer, size_t size)
 {
-    // Dual-interface TX routing (see iface_t in transport.h). Frames go only
-    // to the interface the host last spoke on; in IFACE_NONE (boot frames,
-    // before any host byte) they are offered to every interface with
-    // strictly non-blocking writes.
-    //
-    // Why non-blocking on the non-active path is load-bearing:
-    // usb_serial_jtag_write_bytes copies into the driver's TX ring, which
-    // only drains while a USB host performs IN transactions. With no host
-    // attached the ring fills once and every further timed write blocks for
-    // the full timeout — stalling the app task and throttling the *other*
-    // (active) interface to ~20 frames/s. The driver's xRingbufferSend is
-    // all-or-nothing, so a 0-tick write either queues the whole frame or
-    // nothing — no torn frames. (Verified against IDF 5.5.3
-    // esp_driver_usb_serial_jtag/src/usb_serial_jtag.c.)
-    const uint8_t active = m_active.load(std::memory_order_relaxed);
-    bool delivered = false;
-
-    if (active != IFACE_UART) {
-        const TickType_t ticks = (active == IFACE_USB) ? pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS) : 0;
-        if (usb_serial_jtag_write_bytes(buffer, size, ticks) == (int)size) {
-            delivered = true;
-        } else if (active == IFACE_USB) {
-            ESP_LOGE(TAG, "usb write failed (%u bytes)", (unsigned)size);
-        }
+    utils::sem_lock l(m_client_sem);
+    if (m_client < 0) {
+        // No host: the frame has nobody to go to, which is not an error the
+        // app task should log once per frame.
+        return ESP_OK;
     }
-
-#if CONFIG_NCP_UART_TRANSPORT
-    if (m_uart_ok && active != IFACE_USB) {
-        // uart_write_bytes has NO timeout parameter — it enqueues with
-        // portMAX_DELAY / busy-spins when the TX ring is full. Gate it on the
-        // ring having room for the whole frame (+ item-header margin) so the
-        // call below can never block. The ring drains at baud rate regardless
-        // of a listener, so on the active interface a short bounded wait
-        // mirrors the USB-path semantics; boot frames don't wait at all.
-        size_t free_size = 0;
-        uart_get_tx_buffer_free_size(NCP_UART_PORT, &free_size);
-        if (active == IFACE_UART) {
-            int count = RINGBUF_TIMEOUT_MS / 10;
-            while (free_size < size + UART_TX_ITEM_MARGIN && count-- > 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                uart_get_tx_buffer_free_size(NCP_UART_PORT, &free_size);
-            }
+    const auto* p = static_cast<const uint8_t*>(buffer);
+    size_t off = 0;
+    const int64_t deadline = esp_timer_get_time() + int64_t(TCP_FRAME_DEADLINE_MS) * 1000;
+    while (off < size) {
+        int n = ::send(m_client, p + off, size - off, 0);
+        if (n > 0) {
+            off += n;
+            continue;
         }
-        if (free_size >= size + UART_TX_ITEM_MARGIN) {
-            if (uart_write_bytes(NCP_UART_PORT, buffer, size) == (int)size) {
-                delivered = true;
-            }
-        } else if (active == IFACE_UART) {
-            ESP_LOGE(TAG, "uart tx ring full, dropping frame (%u bytes)", (unsigned)size);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN) && esp_timer_get_time() < deadline) {
+            continue;
         }
+        break;
     }
-#endif
-
-    return delivered ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    if (off == size) {
+        return ESP_OK;
+    }
+    // A frame cut short leaves the host's parser mid-frame, so the link
+    // cannot carry on: end it, and the host reconnects to fresh boot frames.
+    ESP_LOGE(TAG, "send stalled at %u/%u bytes (errno %d), closing the host link",
+             unsigned(off), unsigned(size), errno);
+    ::shutdown(m_client, SHUT_RDWR);
+    return ESP_FAIL;
 }
 
 void transport::rx_pump(const uint8_t* data, int readed) {
@@ -105,11 +76,6 @@ void transport::rx_pump(const uint8_t* data, int readed) {
     // bounded wait so transient backpressure doesn't silently drop host
     // bytes. Splitting one read into several EVENT_OUTPUT posts is safe —
     // the protocol layer reassembles frames across on_rx calls.
-    //
-    // Stream buffers are single-writer; with the UART transport enabled two
-    // RX tasks feed m_output_buf, so the send+event pair is serialised under
-    // m_output_sem (also keeps the EVENT_OUTPUT ordering consistent with the
-    // byte order in the buffer).
     utils::sem_lock l(m_output_sem);
     int off = 0;
     while (off < readed) {
@@ -124,9 +90,9 @@ void transport::rx_pump(const uint8_t* data, int readed) {
         // Bounded retry on a momentarily-full event queue: the bytes are
         // already committed to m_output_buf, so a dropped event would orphan
         // them and shift the byte/event pairing. Retrying HERE is safe —
-        // rx_pump only ever runs on our own RX tasks (USB/UART), never on
-        // the ZBOSS task (app::send_event itself must stay non-blocking for
-        // that caller — see the critical-section panic note there).
+        // rx_pump only ever runs on the server task, never on the ZBOSS task
+        // (app::send_event itself must stay non-blocking for that caller —
+        // see the critical-section panic note there).
         int tries = RINGBUF_TIMEOUT_MS / 10;
         while (app::send_event(ncp_event) != ESP_OK && tries-- > 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -135,69 +101,154 @@ void transport::rx_pump(const uint8_t* data, int readed) {
     }
 }
 
-void transport::rx_qualified_pump(iface_t iface, bool& pending_de, const uint8_t* data, int readed) {
-    // Hardened routing flip (pre-release hardening 2026-06-05): an interface
-    // only becomes the active TX target once a ZBOSS-NCP frame signature
-    // (DE AD) shows up in its RX stream. Without this, ANY received byte
-    // flipped the route — and host-side port probers (canonical case:
-    // ModemManager sending AT commands a few seconds after every USB
-    // re-enumeration, which herdsman triggers via NCP_RESET at each adapter
-    // start) could steal the route from a live UART session and black-hole
-    // the in-flight response. Bytes from a non-active interface are
-    // discarded up to the first DE AD, so prober garbage also can't be
-    // injected into the shared frame stream. The matcher state survives
-    // chunk boundaries via `pending_de` (chunk ended in 0xDE).
-    if (m_active.load(std::memory_order_relaxed) == iface) {
-        pending_de = (data[readed - 1] == 0xDE);   // keep matcher state fresh
-        rx_pump(data, readed);
-        return;
+void transport::close_client_int() {
+    utils::sem_lock l(m_client_sem);
+    if (m_client >= 0) {
+        // shutdown, not close: the server task owns the descriptor and
+        // closes it when its recv returns, so the number cannot be reused
+        // while it is still selecting on it.
+        ::shutdown(m_client, SHUT_RDWR);
     }
+}
 
-    int sig = -1;                                  // index of 0xDE, or -1 for "spans chunks"
-    bool spans = (pending_de && data[0] == 0xAD);
-    if (!spans) {
-        for (int i = 0; i + 1 < readed; ++i) {
-            if (data[i] == 0xDE && data[i + 1] == 0xAD) {
-                sig = i;
-                break;
-            }
-        }
-        if (sig < 0) {
-            pending_de = (data[readed - 1] == 0xDE);
-            return;                                // no signature yet — drop garbage
+void transport::drop_fd(int fd) {
+    utils::sem_lock l(m_client_sem);
+    if (m_client == fd) m_client = -1;
+    if (m_pending == fd) m_pending = -1;
+    ::close(fd);
+}
+
+void transport::on_link_reset_int() {
+    {
+        utils::sem_lock l(m_client_sem);
+        m_client = m_pending;
+        m_pending = -1;
+        if (m_client >= 0) {
+            ::send(m_client, BOOT_ACK, sizeof(BOOT_ACK), 0);
         }
     }
-
-    m_active.store(iface, std::memory_order_relaxed);
-    pending_de = false;
-    if (spans) {
-        const uint8_t de = 0xDE;                   // re-inject the 0xDE swallowed with the previous chunk
-        rx_pump(&de, 1);
-        rx_pump(data, readed);
-    } else {
-        rx_pump(data + sig, readed - sig);
+    protocol::reset_link_state();
+    // Before the stack has loaded its NVRAM the boot-ready frame would let the
+    // host read default PAN values and form a new network over the stored
+    // one (andryblack/esp-coordinator#5); continue_zboss sends it once the
+    // dataset is loaded, to whichever host is connected then.
+    if (zb_ncp::boot_ready()) {
+        zb_ncp::send_boot_ready_frame();
     }
+}
+
+void transport::restart() {
+    close_client();
+    // Long enough for the FIN to leave while the radio is still up.
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_restart();
+}
+
+static void set_client_options(int fd) {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // lwIP's default keepalive idle is two hours, so a host that vanished
+    // without a FIN (a crash, a pulled cable) would hold the only client slot
+    // that long. 15 s matches herdsman's own setKeepAlive; three missed probes
+    // 3 s apart then end the connection.
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    int idle = 15, intvl = 3, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    // The radio is shared with the always-listening coordinator, so Wi-Fi can
+    // be starved for seconds. Without a bound a blocking send would park the
+    // app task, which also serves every Zigbee indication.
+    struct timeval to = {};
+    to.tv_sec = 8;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+}
+
+void transport::serve_client(int fd) {
+    set_client_options(fd);
+    {
+        utils::sem_lock l(m_client_sem);
+        m_pending = fd;
+    }
+    // The new host is switched in on the app task, queued behind the
+    // previous host's bytes and frames, so none of those reaches the new
+    // host or is read as the start of its stream.
+    app::ctx_t reset = {.event = app::EVENT_LINK_RESET, .size = 0};
+    while (app::send_event(reset) != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "host connected");
 }
 
 void transport::task_int() {
-    while (true) {
-        int readed = usb_serial_jtag_read_bytes(m_temp_buf, BUF_SIZE, pdMS_TO_TICKS(10));
-        if (readed > 0) {
-            rx_qualified_pump(IFACE_USB, m_usb_pending_de, m_temp_buf, readed);
-        }
+    m_listen = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (m_listen < 0) {
+        ESP_LOGE(TAG, "socket() failed (errno %d)", errno);
+        vTaskDelete(NULL);
+        return;
     }
-}
+    int one = 1;
+    setsockopt(m_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(CONFIG_ZBOSS_NCP_TCP_PORT);
+    if (::bind(m_listen, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(m_listen, 1) != 0) {
+        ESP_LOGE(TAG, "bind/listen :%d failed (errno %d)", CONFIG_ZBOSS_NCP_TCP_PORT, errno);
+        ::close(m_listen);
+        m_listen = -1;
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "NCP listening on tcp :%d", CONFIG_ZBOSS_NCP_TCP_PORT);
 
-#if CONFIG_NCP_UART_TRANSPORT
-void transport::uart_task_int() {
+    int fd = -1;
     while (true) {
-        int readed = uart_read_bytes(NCP_UART_PORT, m_uart_temp_buf, BUF_SIZE, pdMS_TO_TICKS(10));
-        if (readed > 0) {
-            rx_qualified_pump(IFACE_UART, m_uart_pending_de, m_uart_temp_buf, readed);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(m_listen, &rfds);
+        int maxfd = m_listen;
+        if (fd >= 0) {
+            FD_SET(fd, &rfds);
+            if (fd > maxfd) maxfd = fd;
+        }
+        if (::select(maxfd + 1, &rfds, nullptr, nullptr, nullptr) < 0) {
+            if (errno != EINTR) vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (FD_ISSET(m_listen, &rfds)) {
+            int nfd = ::accept(m_listen, nullptr, nullptr);
+            if (nfd >= 0) {
+                // One host at a time: the NCP has one link state. A host that
+                // reconnects gets the slot at once rather than waiting out the
+                // keepalive on the half-open connection it left behind.
+                if (fd >= 0) {
+                    ESP_LOGW(TAG, "new host replaces the connected one");
+                    drop_fd(fd);
+                }
+                fd = nfd;
+                serve_client(fd);
+            }
+            continue;
+        }
+
+        if (fd >= 0 && FD_ISSET(fd, &rfds)) {
+            int n = ::recv(fd, m_temp_buf, BUF_SIZE, 0);
+            if (n > 0) {
+                rx_pump(m_temp_buf, n);
+                continue;
+            }
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+                continue;
+            }
+            ESP_LOGW(TAG, "host disconnected");
+            drop_fd(fd);
+            fd = -1;
         }
     }
 }
-#endif
 
 size_t transport::output_receive(void* buffer, size_t size) {
 	return xStreamBufferReceive(instance().m_output_buf, buffer, size, pdMS_TO_TICKS(RINGBUF_TIMEOUT_MS));
@@ -291,82 +342,14 @@ esp_err_t transport::init_int() {
     }
 
     m_input_sem = xSemaphoreCreateMutex();
-    if (!m_input_sem) {
-        ESP_LOGE(TAG, "Input semaphore create error");
-        return ESP_ERR_NO_MEM;
-    }
-
     m_output_sem = xSemaphoreCreateMutex();
-    if (!m_output_sem) {
-        ESP_LOGE(TAG, "Output semaphore create error");
+    m_client_sem = xSemaphoreCreateMutex();
+    if (!m_input_sem || !m_output_sem || !m_client_sem) {
+        ESP_LOGE(TAG, "semaphore create error");
         return ESP_ERR_NO_MEM;
     }
-
-    usb_serial_jtag_driver_config_t usb_serial_jtag_config;
-    usb_serial_jtag_config.rx_buffer_size = BUF_SIZE * 2;
-    usb_serial_jtag_config.tx_buffer_size = BUF_SIZE * 2;
-
-    esp_err_t err = usb_serial_jtag_driver_install(&usb_serial_jtag_config);
-    if (err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "USB-JTAG driver already installed. Reusing interface.");
-    } else if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to install USB-JTAG driver: %d", err);
-        return err;
-    }
-
-#if CONFIG_NCP_UART_TRANSPORT
-    // A failed UART bring-up degrades to USB-only instead of failing the
-    // whole transport — the primary link must survive a bad pin config.
-    if (uart_init_int() == ESP_OK) {
-        m_uart_ok = true;
-    } else {
-        ESP_LOGE(TAG, "UART transport init failed -- continuing USB-only");
-    }
-#endif
-
     return ESP_OK;
 }
-
-#if CONFIG_NCP_UART_TRANSPORT
-esp_err_t transport::uart_init_int() {
-    uart_config_t cfg = {};
-    cfg.baud_rate = CONFIG_NCP_UART_BAUD;
-    cfg.data_bits = UART_DATA_8_BITS;
-    cfg.parity = UART_PARITY_DISABLE;
-    cfg.stop_bits = UART_STOP_BITS_1;
-    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-    cfg.source_clk = UART_SCLK_DEFAULT;
-
-    // TX ring gets extra slack: write_int drops frames when the ring can't
-    // take a whole frame, and the ring only drains at baud rate.
-    esp_err_t err = uart_driver_install(NCP_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 4, 0, NULL, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install: %d", err);
-        return err;
-    }
-    err = uart_param_config(NCP_UART_PORT, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_param_config: %d", err);
-        return err;
-    }
-    err = uart_set_pin(NCP_UART_PORT, CONFIG_NCP_UART_TX_GPIO, CONFIG_NCP_UART_RX_GPIO,
-                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_set_pin: %d", err);
-        return err;
-    }
-    // uart_set_pin enables a pull-up only on CTS, NOT on RX (IDF 5.5.3
-    // esp_driver_uart/src/uart.c). An unwired RX must idle high: noise here
-    // would not only feed garbage into the shared NCP stream but also flip
-    // m_active away from a live USB session.
-    gpio_pullup_en((gpio_num_t)CONFIG_NCP_UART_RX_GPIO);
-
-    ESP_LOGI(TAG, "UART transport on UART%d TX=%d RX=%d %d baud",
-             (int)NCP_UART_PORT, CONFIG_NCP_UART_TX_GPIO, CONFIG_NCP_UART_RX_GPIO,
-             CONFIG_NCP_UART_BAUD);
-    return ESP_OK;
-}
-#endif
 
 esp_err_t transport::start_int() {
 	if (!m_input_buf) {
@@ -374,14 +357,8 @@ esp_err_t transport::start_int() {
 		return ESP_FAIL;
 	}
 	ESP_LOGI(TAG,"start");
-	if (xTaskCreate(&task, "transport", TASK_STACK, this, TASK_PRIORITY, NULL) != pdTRUE) {
+	if (xTaskCreate(&task, "ncp_tcp", TASK_STACK, this, TASK_PRIORITY, NULL) != pdTRUE) {
 		return ESP_FAIL;
 	}
-#if CONFIG_NCP_UART_TRANSPORT
-	if (m_uart_ok &&
-	    xTaskCreate(&uart_task, "transport_uart", TASK_STACK, this, TASK_PRIORITY, NULL) != pdTRUE) {
-		return ESP_FAIL;
-	}
-#endif
 	return ESP_OK;
 }

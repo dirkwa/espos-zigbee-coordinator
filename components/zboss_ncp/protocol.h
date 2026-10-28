@@ -60,6 +60,7 @@ private:
 	void send_ack(const ncp_header_t& hdr);
 	void send_nack(const ncp_header_t& hdr);
 	esp_err_t send_data_int(const void* data,size_t size);
+	void reset_link_state_int();
 	
 public:
 	// Largest single frame the protocol layer ever hands to transport::send
@@ -78,4 +79,8 @@ public:
 	static esp_err_t send_data(const void* data,size_t size) {
 		return instance().send_data_int(data,size);
 	}
+	// Back to the state after a boot, for a host that has just connected:
+	// its sequence numbers restart at 0 and it has seen none of ours. App
+	// task only, like on_rx.
+	static void reset_link_state() { instance().reset_link_state_int(); }
 };

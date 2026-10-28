@@ -2,7 +2,9 @@
 #include "nvs_flash.h"
 #include "app.h"
 #include "boot_guard.h"
-#include "version.h"
+#include "transport.h"
+#include <esp_app_desc.h>
+#include <cstdio>
 
 #include "commands_helpers.h"
 #include <esp_mac.h>
@@ -44,11 +46,16 @@ struct zb_ncp::cmd_handle<GET_MODULE_VERSION> : immediate_cmd_process<GET_MODULE
 		general_status_res<GET_MODULE_VERSION,GET_MODULE_VERSION_resp_t> {
 	static void process_status_res(ncp_generic_status_t& status,GET_MODULE_VERSION_resp_t* res) {
     	// Encode firmware build into the uint32 Z2M shows as fwVersion.
-    	// Layout: MAJOR.MINOR.BUILD with 16-bit BUILD; v1.1.0 = 0x01010000.
-    	// Sourced from main/version.h (configure_file from version.h.in).
-    	res->fwVersion = (uint32_t(FW_VERSION_MAJOR) << 24)
-    	               | (uint32_t(FW_VERSION_MINOR) << 16)
-    	               | (uint32_t(FW_VERSION_BUILD) & 0xFFFF);
+    	// Layout: MAJOR.MINOR.PATCH with a 16-bit PATCH; v1.1.0 = 0x01010000.
+    	// The app version espOS stamps from the release tag; a build between
+    	// releases ("0.1.0-3-gabc") reports the release it follows.
+    	const char* ver = esp_app_get_description()->version;
+    	if (*ver == 'v') ++ver;
+    	unsigned major = 0, minor = 0, patch = 0;
+    	sscanf(ver, "%u.%u.%u", &major, &minor, &patch);
+    	res->fwVersion = (uint32_t(major & 0xFF) << 24)
+    	               | (uint32_t(minor & 0xFF) << 16)
+    	               | (uint32_t(patch) & 0xFFFF);
         res->stackVersion = zboss_version_get();
         res->protocolVersion = ZB_PROTOCOL_VERSION;
     }
@@ -155,7 +162,7 @@ static void ncp_reset_deferred_task(void* arg) {
     // response itself — see cmd_handle<NCP_RESET> below.
     vTaskDelay(pdMS_TO_TICKS(150));
     ESP_LOGI(TAG,"restart");
-    esp_restart();
+    transport::restart();
 }
 
 // NCP_RESET deliberately sends NO pre-reboot response (changed 2026-06-05,
@@ -2206,7 +2213,7 @@ struct zb_ncp::cmd_handle<ZDO_SET_NODE_DESC_MANUF_CODE> : immediate_cmd_process<
 // reused for every chunk — esp_partition_find_first is not free.
 static inline const esp_partition_t* backup_nvs_partition() {
     static const esp_partition_t* p = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, ZB_NVS_PARTITION);
     return p;
 }
 static inline const esp_partition_t* backup_zb_partition() {
@@ -2279,7 +2286,7 @@ static void restore_schedule_reboot() {
     if (s_restore_reboot_pending) return;   // idempotent: one reboot task only
     s_restore_reboot_pending = true;
     ESP_LOGI(TAG, "RESTORE_NETWORK: rebooting in 1s");
-    xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(1000)); esp_restart(); },
+    xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(1000)); transport::restart(); },
                 "reboot", 2048, NULL, 5, NULL);
 }
 
@@ -2572,8 +2579,7 @@ struct zb_ncp::cmd_handle<RESTORE_NETWORK> : immediate_cmd_process<RESTORE_NETWO
                 // nvs + zb_storage stay intact on flash for the whole upload.
             } else {
                 ESP_LOGW(TAG, "RESTORE_NETWORK: buffer declined (heap), streaming without gate");
-                extern esp_err_t nvs_flash_deinit(void);
-                nvs_flash_deinit();
+                nvs_flash_deinit_partition(ZB_NVS_PARTITION);
                 // Flash is about to be erased -- latch dirty so EVERY later exit
                 // reboots (review #1), including a failed erase below.
                 s_restore_flash_dirty = true;
@@ -2661,8 +2667,7 @@ struct zb_ncp::cmd_handle<RESTORE_NETWORK> : immediate_cmd_process<RESTORE_NETWO
                 // Gate passed: commit BOTH halves. Erasing irreversibly destroys
                 // the old network, so from here flash is dirty and we ALWAYS reboot
                 // (NVS is deinit'd; app::init re-mounts it next boot).
-                extern esp_err_t nvs_flash_deinit(void);
-                nvs_flash_deinit();
+                nvs_flash_deinit_partition(ZB_NVS_PARTITION);
                 s_restore_flash_dirty = true;
                 esp_err_t e1 = esp_partition_erase_range(nvs_part, 0, nvs_part->size);
                 esp_err_t e2 = esp_partition_erase_range(zb_part,  0, zb_part->size);
@@ -2872,7 +2877,7 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
         }
 
         nvs_handle_t nh;
-        esp_err_t err = nvs_open("restore_pend", NVS_READWRITE, &nh);
+        esp_err_t err = nvs_open_from_partition(ZB_NVS_PARTITION, "restore_pend", NVS_READWRITE, &nh);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: nvs_open failed: %s",
                      esp_err_to_name(err));
@@ -2907,7 +2912,7 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
 
         ESP_LOGI(TAG, "RESTORE_STRUCTURED_BACKUP: %u-byte image stored, rebooting in 1s",
                  (unsigned)inlen);
-        xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(1000)); esp_restart(); },
+        xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(1000)); transport::restart(); },
                     "rb_struct", 2048, NULL, 5, NULL);
 
         return reply(outdata, GENERIC_OK);

@@ -9,6 +9,8 @@
 #include "nwk/esp_zigbee_nwk.h"
 #include "esp_zigbee_secur.h"
 #include <nvs.h>
+#include <atomic>
+#include "app.h"
 // NOTE: deliberately NOT including esp_zigbee_core.h — referencing any of its
 // symbols (e.g. esp_zb_set_primary_network_channel_set) pulls in
 // esp_zigbee_core.c.obj from libesp_zb_api.zczr.a, which redefines our own
@@ -46,7 +48,7 @@ static bool s_restore_applied = false;
 // neighbor table is rebuilt by ZBOSS, so TAG_DEVICE_TABLE is ignored here.
 static void apply_pending_restore() {
     nvs_handle_t nh;
-    esp_err_t err = nvs_open("restore_pend", NVS_READWRITE, &nh);
+    esp_err_t err = nvs_open_from_partition(ZB_NVS_PARTITION, "restore_pend", NVS_READWRITE, &nh);
     if (err != ESP_OK) {
         return; // no pending restore is the common path
     }
@@ -541,7 +543,14 @@ void zb_ncp::request_watchdog_tick() {
     }
 }
 
+static std::atomic<bool> s_boot_ready{false};
+
+bool zb_ncp::boot_ready() {
+    return s_boot_ready.load(std::memory_order_relaxed);
+}
+
 void zb_ncp::send_boot_ready_frame() {
+    s_boot_ready.store(true, std::memory_order_relaxed);
     static const uint8_t boot_ready_frame[] = {
         0xDE, 0xAD,             // signature
         0x0E, 0x00,             // packet_len = 14

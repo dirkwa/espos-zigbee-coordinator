@@ -100,8 +100,11 @@ esp_err_t app::process_event(const ctx_t& ctx) {
                 process_event(pending);
             }
             vTaskDelay(pdMS_TO_TICKS(100));
-            esp_restart();
+            transport::restart();
         } break;
+        case EVENT_LINK_RESET:
+            transport::on_link_reset();
+            break;
         default:
             break;
     }
@@ -131,13 +134,9 @@ esp_err_t app::start_int() {
 	if (res != ESP_OK)
 		return res;
 
-    // Boot-time framing-level ACK. Sent immediately at start-up so z2m's
-    // open-port handshake doesn't time out waiting for ANY frame from us.
-    // Carries no NVRAM-state-dependent fields — flags byte is_ack=1 with
-    // packet_seq=0 and ack_seq=0 (the "wake up call" pattern from
-    // andryblack/esp-coordinator#11).
-    uint8_t raw_data[] = {0xDE, 0xAD, 0x05, 0x00, 0x06, 0x01, 0x8F};
-    transport::send(raw_data, sizeof(raw_data));
+    // The boot-time framing ACK upstream sends here goes to each host as it
+    // connects instead (transport::on_link_reset): over TCP no host is
+    // listening at boot.
 
     if (boot_guard::safe_mode()) {
         // WEDGE-1 safe mode: repeated early-boot failures — bring up the
@@ -184,6 +183,17 @@ esp_err_t app::start_int() {
     // esp_ncp_header_t header = {{0,0,0,},NCP_RESET,0,0};
     // esp_ncp_resp_input(&header, outdata, sizeof(outdata)); 
 
+	if (xTaskCreate(&app::task, "ncp_app", APP_TASK_STACK, this, APP_TASK_PRIORITY, NULL) != pdTRUE) {
+		return ESP_ERR_NO_MEM;
+	}
+	return ESP_OK;
+}
+
+void app::task(void* arg) {
+	static_cast<app*>(arg)->run();
+}
+
+void app::run() {
 	ctx_t ctx;
     while (true) {
         // Bounded wait so the request watchdog runs even on an idle link; on a
@@ -200,20 +210,19 @@ esp_err_t app::start_int() {
         }
         zb_ncp::request_watchdog_tick();
     }
-	return ESP_OK;
 }
 
 esp_err_t app::init() {
 	ESP_LOGI(TAG,"init");
-	auto res = nvs_flash_init();
+	// The coordinator's own NVS partition: espOS keeps its settings, Wi-Fi
+	// credentials and keys in "nvs", which a network backup must neither
+	// export nor overwrite. An image a restore left unmountable is erased,
+	// as upstream does for its "nvs", instead of failing the boot.
+	auto res = nvs_flash_init_partition(ZB_NVS_PARTITION);
 	if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-		// M2: a host RESTORE_NETWORK can leave nvs in a layout this IDF build
-		// can't mount. Erase + re-init instead of returning the error up into
-		// ESP_ERROR_CHECK(app::init()) in main.cpp, which would abort and boot-
-		// loop the device with the host's serial port never answering again.
-		ESP_LOGW(TAG, "nvs_flash_init: %s -- erasing and retrying", esp_err_to_name(res));
-		nvs_flash_erase();
-		res = nvs_flash_init();
+		ESP_LOGW(TAG, "nvs_flash_init_partition: %s -- erasing and retrying", esp_err_to_name(res));
+		nvs_flash_erase_partition(ZB_NVS_PARTITION);
+		res = nvs_flash_init_partition(ZB_NVS_PARTITION);
 	}
 	if (res != ESP_OK)
 		return res;

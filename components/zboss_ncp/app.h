@@ -4,12 +4,16 @@
 #include <freertos/FreeRTOS.h>
 #include <sys/queue.h>
 
+// The partition the NCP keeps its own NVS data in (UPSTREAM.md).
+#define ZB_NVS_PARTITION "zb_nvs"
+
 class app {
 public:
 	enum event_t : uint16_t {
 	   EVENT_INPUT,                /*!< Input event from NCP to host */
 	   EVENT_OUTPUT,               /*!< Output event from host to NCP */
 	   EVENT_RESET,                /*!< Reset event from host to NCP */
+	   EVENT_LINK_RESET,           /*!< A new host connected: switch to it (transport) */
 	};
 	struct ctx_t {
 		event_t event;	/*!< The event between the host and NCP */
@@ -23,8 +27,13 @@ private:
 	esp_err_t start_int();
 
 	esp_err_t process_event(const ctx_t& ctx);
+	static void task(void*);
+	[[noreturn]] void run();
 	static constexpr size_t EVENT_QUEUE_LEN = 60;
 	static constexpr size_t TIMEOUT_MS  = 10;
+	// Upstream runs this loop on the main task; espOS's app_main returns.
+	static constexpr size_t APP_TASK_STACK = 1024*6;
+	static constexpr UBaseType_t APP_TASK_PRIORITY = 5;
 
 	// Sized to the LARGER of the two directions multiplexed through m_buffer in
 	// process_event:

@@ -1,0 +1,11 @@
+menu "Zigbee NCP over TCP"
+    config ZBOSS_NCP_TCP_PORT
+        int "TCP port the NCP serves its host on"
+        range 1 65535
+        default 6638
+        help
+            Zigbee2MQTT connects with adapter "zboss" and port
+            "tcp://<device>:<this port>". 6638 is what busware's Wi-Fi build
+            of esp-coordinator uses, so a Zigbee2MQTT already set up for one
+            needs only the address changed.
+endmenu

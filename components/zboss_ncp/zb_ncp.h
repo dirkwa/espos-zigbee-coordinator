@@ -69,6 +69,10 @@ public:
 	// so hosts proceed to their first getters and fail VISIBLY on
 	// GENERIC_BLOCKED rather than timing out on a silent port.
 	static void send_boot_ready_frame();
+	// True once the boot-ready frame has been sent: from then on every host
+	// that connects is sent it too, since over TCP none may have been
+	// listening the first time.
+	static bool boot_ready();
 	static void on_rx_data(const void* data,size_t size);
 	static void indication(command_id_t cmd,const void* data,size_t size);
 	static void send_cmd_data(const void* data,size_t size);

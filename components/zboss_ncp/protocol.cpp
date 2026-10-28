@@ -266,6 +266,14 @@ esp_err_t protocol::on_rx_int(const void* data,size_t size) {
 
 
 
+void protocol::reset_link_state_int() {
+	utils::sem_lock l(m_tx_sem);
+	m_rx_buffer_pos = 0;
+	m_tx_seq = 1;
+	m_last_rx_seq = 0;
+	m_last_rx_seq_valid = false;
+}
+
 esp_err_t protocol::init_int() {
 	ESP_LOGI(TAG,"init");
 	m_rx_buffer_pos = 0;
@@ -278,10 +286,9 @@ esp_err_t protocol::init_int() {
 	// 1->2->3->1 (seq 0 only used at boot).
 	m_tx_seq = 1;
 	// DUP-1: no host data frame accepted yet — first frame after boot is
-	// fresh regardless of its seq. NOTE for the wifi-coex merge: the TCP
-	// transport's reset_link_state() must ALSO clear these two on a fresh
-	// accept, or a stale seq from the previous TCP session could eat the
-	// first flagged retransmission of the new one.
+	// fresh regardless of its seq. reset_link_state() clears these two
+	// again for every new host, or a stale seq from the previous connection
+	// could eat the first flagged retransmission of the new one.
 	m_last_rx_seq = 0;
 	m_last_rx_seq_valid = false;
 	m_tx_sem = xSemaphoreCreateMutex();
