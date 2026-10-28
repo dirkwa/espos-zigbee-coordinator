@@ -24,6 +24,7 @@ private:
 	app();
 	static app& instance();
 	esp_err_t send_event_int(const ctx_t& ctx);
+	esp_err_t post_event_int(const ctx_t& ctx, TickType_t wait);
 	esp_err_t init_int();
 	esp_err_t start_int();
 
@@ -41,10 +42,9 @@ private:
 	//   - host->NCP read chunk = transport::BUF_SIZE       (1024)
 	//   - NCP->host frame       = protocol::MAX_FRAME_SIZE  (2048; full 64-entry
 	//                             Mgmt_Lqi / Mgmt_Bind responses)
-	// Undersizing strands oversize NCP->host frames: transport commits them to
-	// m_input_buf, then process_event rejects ctx.size>BUFFER_SIZE and the bytes
-	// rot in the FIFO -> permanent link desync (H1). The static_assert in
-	// app.cpp ties this to protocol's value so the two layers can't drift.
+	// Undersizing strands oversize NCP->host frames in transport's message
+	// buffer, which then blocks every frame behind them (H1). The static_assert
+	// in app.cpp ties this to protocol's value so the two layers can't drift.
 	static constexpr size_t BUFFER_SIZE = 2048;
 
 	QueueHandle_t m_queue; 
@@ -53,6 +53,9 @@ private:
 public:
 	
 	static esp_err_t send_event(const ctx_t& ctx){ return instance().send_event_int(ctx); }
+	// For a task that may wait for room, never the ZBOSS task (see
+	// send_event_int): waits up to `wait` and does not log a full queue.
+	static esp_err_t post_event(const ctx_t& ctx, TickType_t wait){ return instance().post_event_int(ctx, wait); }
 
 	static esp_err_t init();
 	static esp_err_t start();

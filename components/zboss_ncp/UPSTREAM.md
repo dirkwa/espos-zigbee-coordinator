@@ -13,11 +13,15 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
 - **Host link over TCP, not USB or UART** (`transport`). One host on
   `CONFIG_ZBOSS_NCP_TCP_PORT` (6638, as upstream's Wi-Fi build). Every
   connection is sent the boot frames on accept and becomes the host once it
-  sends a ZBOSS frame, as upstream's DE AD gate does for its interfaces. The
-  switch is one app-task event (`EVENT_LINK_RESET`, tagged with a
-  generation): the link state is reset, the route moves, and frames stamped
-  for the previous host are dropped. Sends are bounded at 8 s per frame in
-  0.5 s slices.
+  sends a ZBOSS frame header with a valid CRC, as upstream's DE AD gate does
+  for its interfaces; up to three connections wait at once. The switch is one
+  app-task event (`EVENT_LINK_RESET`, tagged with a generation): the link
+  state is reset, the route moves, and frames stamped for the previous host
+  are dropped. Sends are bounded at 8 s per frame in 0.5 s slices.
+- **NCP-to-host frames in a message buffer**, not a stream buffer, and each
+  `EVENT_INPUT` drains all of them. A frame whose event was dropped on a full
+  queue then goes out with the next drain instead of shifting every frame
+  after it.
 - **Link state reset** (`protocol::reset_link_state`): sequence numbers and
   the receive buffer back to boot state for each new host.
 - **Boot frames per host.** Upstream sends the framing ACK and the

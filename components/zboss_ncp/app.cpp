@@ -7,6 +7,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <cstdint>
 
 static const char* TAG = "APP";
 
@@ -38,7 +39,7 @@ esp_err_t app::send_event_int(const ctx_t& ctx) {
         // nesting count -> vPortExitCritical assert panic on ncp_zb_task
         // (reproduced on the wifi-coex branch 2026-06-06). Callers that CAN
         // safely wait (the transport RX tasks) implement their own bounded
-        // retry around this call instead (transport::rx_pump).
+        // wait instead (post_event).
         ret = xQueueSend(m_queue, &ctx, 0);
         if (ret != pdTRUE) {
             ESP_LOGE(TAG, "event queue full, event %d (size %u) dropped",
@@ -49,24 +50,29 @@ esp_err_t app::send_event_int(const ctx_t& ctx) {
     return (ret == pdTRUE) ? ESP_OK : ESP_FAIL ;
 }
 
+esp_err_t app::post_event_int(const ctx_t& ctx, TickType_t wait) {
+	return xQueueSend(m_queue, &ctx, wait) == pdTRUE ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t app::process_event(const ctx_t& ctx) {
 	// H1: m_buffer carries BOTH directions (EVENT_INPUT = NCP->host frame,
 	// EVENT_OUTPUT = host->NCP chunk). It must hold the largest protocol frame
-	// or such frames get rejected below *after* transport already queued them
-	// into m_input_buf -> the bytes strand and the link desyncs.
+	// or transport cannot drain such a frame, and it blocks every frame
+	// queued behind it.
 	static_assert(BUFFER_SIZE >= protocol::MAX_FRAME_SIZE,
 	              "app::BUFFER_SIZE must cover protocol::MAX_FRAME_SIZE (H1)");
 	size_t recv_size = 0;
     esp_err_t ret = ESP_OK;
 
-    if (ctx.size > sizeof(m_buffer)) {
+    // Only EVENT_OUTPUT reads ctx.size bytes into m_buffer.
+    if (ctx.event == EVENT_OUTPUT && ctx.size > sizeof(m_buffer)) {
         ESP_LOGE(TAG, "Process event out of memory %d",ctx.size);
         return ESP_ERR_NO_MEM;
     }
 
     switch (ctx.event) {
         case EVENT_INPUT:
-        	ret = transport::process_input(m_buffer,ctx.size);
+        	transport::process_input(m_buffer, sizeof(m_buffer), 2);
             break;
         case EVENT_OUTPUT:
             recv_size = transport::output_receive(m_buffer,ctx.size);
@@ -99,6 +105,7 @@ esp_err_t app::process_event(const ctx_t& ctx) {
             while (xQueueReceive(m_queue, &pending, 0) == pdTRUE) {
                 process_event(pending);
             }
+            transport::process_input(m_buffer, sizeof(m_buffer), SIZE_MAX);
             vTaskDelay(pdMS_TO_TICKS(100));
             transport::restart();
         } break;
@@ -106,7 +113,7 @@ esp_err_t app::process_event(const ctx_t& ctx) {
             transport::on_link_reset(ctx.size);
             break;
         case EVENT_BOOT_READY:
-            transport::poll_boot_ready();
+            transport::poll_boot_ready(m_buffer, sizeof(m_buffer));
             break;
         default:
             break;
@@ -138,7 +145,7 @@ esp_err_t app::start_int() {
 		return res;
 
     // The boot-time framing ACK upstream sends here goes to each host as it
-    // connects instead (transport::on_link_reset): over TCP no host is
+    // connects instead (transport::add_candidate): over TCP no host is
     // listening at boot.
 
     if (boot_guard::safe_mode()) {
@@ -212,7 +219,10 @@ void app::run() {
             }
         }
         zb_ncp::request_watchdog_tick();
-        transport::poll_boot_ready();
+        if (uxQueueMessagesWaiting(m_queue) == 0) {
+            transport::process_input(m_buffer, sizeof(m_buffer), SIZE_MAX);
+        }
+        transport::poll_boot_ready(m_buffer, sizeof(m_buffer));
     }
 }
 
