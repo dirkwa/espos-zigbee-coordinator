@@ -281,10 +281,10 @@ struct request_cmd_resolver {
 		request_t* res = nullptr;
 		const uint32_t epoch = protocol::epoch();
 		for (auto& req:storage()) {
-			// A previous host's request is as good as free: nothing will
-			// answer it, and its late callback can no longer match the slot.
-			if (req.state == request_t::S_NONE ||
-			    (req.state == request_t::S_EXEC && req.epoch != epoch)) {
+			// A previous host's request keeps its slot until its callback
+			// comes: ZBOSS still holds it, and reusing the slot would let
+			// that callback match whatever request takes the tsn next.
+			if (req.state == request_t::S_NONE) {
 				res = &req;
 				break;
 			}
@@ -339,23 +339,27 @@ struct request_cmd_resolver {
 	// re-pick the still-S_EXEC slot and reassign it — then the late S_NONE write
 	// clobbered a fresh request. Copying out + freeing up front closes that
 	// window: the blocking send then runs on a local copy nobody else can touch.
-	// A previous host's slot with this tsn is freed and skipped, so its
-	// late callback cannot answer the new host's request that reused the tsn.
+	// Two slots share a tsn only once ZBOSS's 8-bit counter has wrapped
+	// with the first still pending, so a callback belongs to the older one.
+	// A previous host's slot is freed without an answer.
 	static bool resolve_take(uint8_t tsn, request_t& out) {
 		utils::sem_lock l(request_resolver_mutex());
-		const uint32_t epoch = protocol::epoch();
+		request_t* hit = nullptr;
 		for (auto& req:storage()) {
-			if (req.state == request_t::S_EXEC && req.tsn == tsn) {
-				if (req.epoch != epoch) {
-					req.state = request_t::S_NONE;
-					continue;
-				}
-				out = req;
-				req.state = request_t::S_NONE;
-				return true;
+			if (req.state == request_t::S_EXEC && req.tsn == tsn &&
+			    (!hit || req.old < hit->old)) {
+				hit = &req;
 			}
 		}
-		return false;
+		if (!hit) {
+			return false;
+		}
+		hit->state = request_t::S_NONE;
+		if (hit->epoch != protocol::epoch()) {
+			return false;
+		}
+		out = *hit;
+		return true;
 	}
 
 	// APS-SEC-2: take exactly the request a confirm belongs to — slot `idx`, and
