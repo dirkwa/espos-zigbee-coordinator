@@ -8,4 +8,4 @@
 # field.
 idf_component_register(
     SRCS main.cpp
-    PRIV_REQUIRES espos_core espos_net espos_ota zboss_ncp esp_coex)
+    PRIV_REQUIRES espos_core espos_net espos_ota zboss_ncp)
