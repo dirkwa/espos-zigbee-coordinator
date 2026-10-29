@@ -10,17 +10,21 @@ connects to it over the network and runs the Zigbee network through it,
 exactly as it would through a USB stick. Pairing, devices and their values
 stay in Zigbee2MQTT and the Signal K plugin that runs it.
 
-**Status:** it builds; it has not been tested on hardware yet.
+**Status:** runs on a Waveshare ESP32-C5 kit: Zigbee2MQTT connects over
+Wi-Fi and forms the network. Pairing devices through it is still to be
+tried; the ESP32-C6 build has not met a board yet.
 
 ## Hardware
 
 | Board | Flash | Status |
 |---|---|---|
-| Waveshare ESP32-C5-WIFI6-KIT | 16 MB | builds only |
+| Waveshare ESP32-C5-WIFI6-KIT (N16R8) | 16 MB | runs |
 | ESP32-C6 dev kits (ESP32-C6-DevKitC-1 and similar) | 8 MB or 16 MB | builds only |
 
 Boards with 4 MB of flash are too small: the firmware does not fit their app
-slots.
+slots. An ESP32-C5 also needs PSRAM, which every C5 module seen so far
+carries: without it the chip's internal RAM is too small for Wi-Fi and the
+Zigbee stack together, and the coordinator does not start.
 
 Wi-Fi and Zigbee share one 2.4 GHz radio on these chips, and the chip
 switches between them. For a handful of sensors that is fine. A large network
