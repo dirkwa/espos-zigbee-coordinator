@@ -2811,7 +2811,11 @@ struct zb_ncp::cmd_handle<GET_STRUCTURED_BACKUP> : immediate_cmd_process<GET_STR
         if (esp_zb_secur_primary_network_key_get(nwk_key) == ESP_OK) {
             emit(backup_structured::TAG_NWK_KEY, nwk_key, 16);
         } else {
+            // A backup without the key cannot be restored (image_valid
+            // refuses it), so tell the host instead of handing it one.
             ESP_LOGW(TAG, "GET_STRUCTURED_BACKUP: NWK key not available (not joined?)");
+            status->status = GENERIC_OPERATION_FAILED;
+            return sizeof(generic_response_t);
         }
 
         uint32_t fc = esp_zb_nwk_get_frame_counter();
@@ -2906,10 +2910,15 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
                      esp_err_to_name(err));
             return reply(outdata, GENERIC_OPERATION_FAILED);
         }
-        err = nvs_set_blob(nh, "tlv", inbuffer, inlen);
+        // The image is replayed only once "armed" is set, which happens after
+        // zb_storage is erased. Whatever fails before that, including removing
+        // the image again, leaves nothing a boot would replay over old storage.
+        err = nvs_erase_key(nh, "armed");
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        if (err == ESP_OK) err = nvs_set_blob(nh, "tlv", inbuffer, inlen);
         if (err == ESP_OK) err = nvs_commit(nh);
-        nvs_close(nh);
         if (err != ESP_OK) {
+            nvs_close(nh);
             ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: nvs_set_blob/commit failed: %s",
                      esp_err_to_name(err));
             return reply(outdata, GENERIC_OPERATION_FAILED);
@@ -2927,24 +2936,23 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
                 // failure; the host can retry the whole RESTORE_STRUCTURED.
                 ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: zb erase failed: %s",
                          esp_err_to_name(ze));
-                // The image is already stored; a later boot would replay it
-                // over the storage that failed to erase.
-                nvs_handle_t pending;
-                esp_err_t pe = nvs_open_from_partition(ZB_NVS_PARTITION, "restore_pend",
-                                                       NVS_READWRITE, &pending);
-                if (pe == ESP_OK) {
-                    pe = nvs_erase_key(pending, "tlv");
-                    if (pe == ESP_OK) pe = nvs_commit(pending);
-                    nvs_close(pending);
-                }
-                if (pe != ESP_OK) {
-                    ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: pending image not removed: %s",
-                             esp_err_to_name(pe));
-                }
+                // Not armed, so never replayed; drop the image to free the space.
+                if (nvs_erase_key(nh, "tlv") == ESP_OK) nvs_commit(nh);
+                nvs_close(nh);
                 return reply(outdata, GENERIC_OPERATION_FAILED);
             }
         } else {
             ESP_LOGW(TAG, "RESTORE_STRUCTURED_BACKUP: zb_storage partition missing");
+        }
+        err = nvs_set_u8(nh, "armed", 1);
+        if (err == ESP_OK) err = nvs_commit(nh);
+        nvs_close(nh);
+        if (err != ESP_OK) {
+            // zb_storage is already erased: the next boot comes up factory
+            // new, and the host can send the restore again.
+            ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: arming failed: %s",
+                     esp_err_to_name(err));
+            return reply(outdata, GENERIC_OPERATION_FAILED);
         }
 
         ESP_LOGI(TAG, "RESTORE_STRUCTURED_BACKUP: %u-byte image stored, rebooting in 1s",

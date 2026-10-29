@@ -31,8 +31,8 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
 - **Fixes in upstream's handlers**, to be offered upstream:
   `RESTORE_STRUCTURED_BACKUP` and the restore replay accept only a complete
   image with its network key (`backup_structured::image_valid`) before
-  erasing `zb_storage` or forming, and drop the stored image when that erase
-  fails; a failed BDB start or ZBOSS task creation answers the pending
+  erasing `zb_storage` or forming, and replay it only once it is armed after
+  that erase succeeded; a backup without the key is answered with an error; a failed BDB start or ZBOSS task creation answers the pending
   `NWK_FORMATION` / `NWK_START_WITHOUT_FORMATION` with an error; host
   channel masks outside 11-26 or empty are refused; the Simple_Desc_rsp
   intercept leaves a success body under 8 bytes to the stack and reads the

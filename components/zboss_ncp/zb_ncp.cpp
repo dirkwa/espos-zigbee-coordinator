@@ -51,6 +51,13 @@ static void apply_pending_restore() {
     if (err != ESP_OK) {
         return; // no pending restore is the common path
     }
+    // RESTORE_STRUCTURED_BACKUP arms the image only after zb_storage is
+    // erased; an unarmed one would be replayed over the old network.
+    uint8_t armed = 0;
+    if (nvs_get_u8(nh, "armed", &armed) != ESP_OK || armed != 1) {
+        nvs_close(nh);
+        return;
+    }
     size_t blob_size = 0;
     err = nvs_get_blob(nh, "tlv", nullptr, &blob_size);
     if (err != ESP_OK || blob_size < sizeof(backup_structured::header_t)) {
@@ -76,6 +83,7 @@ static void apply_pending_restore() {
     // network identity is then lost (user must re-restore manually) but the
     // chip is recoverable without reflashing.
     nvs_erase_key(nh, "tlv");
+    nvs_erase_key(nh, "armed");
     nvs_commit(nh);
     nvs_close(nh);
 
