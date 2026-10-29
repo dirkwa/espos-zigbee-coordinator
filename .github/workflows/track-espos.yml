@@ -1,0 +1,308 @@
+# SPDX-FileCopyrightText: 2026 Dirk Wahrheit
+# SPDX-License-Identifier: Apache-2.0
+#
+# Follows espOS releases. When espOS cuts vX.Y.Z, this opens a PR that moves
+# the `espos` submodule to that tag, so the coordinator picks up espOS fixes
+# without anyone having to notice a release. Same job as the cockpit's
+# track-espos.yml, minus the parts that do not apply here (see below).
+#
+# It opens the PR and stops there. A submodule bump changes the binary that goes
+# on a boat, so a human merges it after the PR's CI is green (every target
+# builds there) and, where it matters, after flashing a build to a device.
+# Merging makes release-please propose the next coordinator release as usual.
+#
+# A submodule never moves on its own, and Dependabot's gitsubmodule ecosystem is
+# no substitute: it follows the tip of espOS main rather than release tags.
+#
+# What the cockpit's version does and this one does not:
+#
+# - No dependencies.lock step. The lock is git-ignored here, so every build
+#   solves it afresh against the pinned espOS manifests; there is nothing to
+#   regenerate or commit.
+# - No firmware dispatch. release-firmware.yml's workflow_dispatch needs an
+#   existing release TAG and attaches assets to that release, so dispatching it
+#   on a tracking branch would build the wrong thing or publish to the wrong
+#   release. The PR's own CI answers "does it build"; signed images come from
+#   the release that follows the merge.
+#
+# The PR is opened with a GitHub App's token (RELEASE_APP_PRIVATE_KEY, with the
+# App's Client ID inline), because GitHub holds the checks of a PR opened with
+# the workflow token until a maintainer approves them, while an App's PR runs
+# them at once. The App must be installed on this repository: the key alone
+# gets a 404. Without the secret, or without the installation, it falls back to
+# the workflow token, which also needs "Allow GitHub Actions to create and
+# approve pull requests" enabled in the repository's Actions settings.
+name: Track espOS releases
+
+# One run at a time: a scheduled and a manual run overlapping could both see no
+# tracking branch and race to push one.
+concurrency:
+  group: track-espos
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # Daily. espOS lives in another organisation, so it cannot notify this
+    # repository without a cross-org token; a day's delay costs nothing.
+    - cron: '35 5 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "espOS tag to move to (default: the latest release)"
+        required: false
+
+permissions: {}
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      # A flag, because a step's `if` cannot read secrets. Only the flag: the
+      # key itself in the job environment would reach every step.
+      APP_CONFIGURED: >-
+        ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+    steps:
+      # fetch-depth: 0 so the submodule has its history: whether the release is
+      # newer than the pin is answered by ancestry, which needs both commits.
+      # No persisted credentials; the push passes the token explicitly.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine the espOS release to track
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          EXPLICIT=yes
+          if [ -z "$TAG" ]; then
+            EXPLICIT=no
+            # releases/latest skips prereleases and drafts: the coordinator follows
+            # stable espOS only. A prerelease can still be taken by naming it.
+            TAG=$(gh api repos/signalk-espOS/espOS/releases/latest --jq .tag_name)
+          fi
+          # Anchored: the tag becomes part of a branch name and a revision
+          # expression below.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not a vX.Y.Z tag"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "explicit=$EXPLICIT" >> "$GITHUB_OUTPUT"
+
+          git -C espos fetch --quiet --tags origin
+          PINNED=$(git rev-parse HEAD:espos)
+          TARGET=$(git -C espos rev-parse "$TAG^{commit}")
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+
+          skip() { echo "$1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          if [ "$PINNED" = "$TARGET" ]; then
+            skip "Already pinned to $TAG ($TARGET)."
+          fi
+          # Closed counts too, looked up by head name: a declined bump is not
+          # reopened daily, even after its branch was deleted with the PR. Only
+          # PRs from this repository count. --limit because gh returns 30 by
+          # default, and a match past that would reopen a declined bump.
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "track-espos-$TAG" \
+                  --state all --limit 1000 --json number,isCrossRepository \
+                  --jq 'map(select(.isCrossRepository == false)) | length')
+          if [ "$PRS" -gt 0 ]; then
+            skip "track-espos-$TAG already has a PR."
+          fi
+          # Never move backwards, or sideways, on its own: the pin may sit ahead
+          # of the newest release on a commit from espOS main. A tag named by
+          # hand bypasses this, so a deliberate rollback stays possible.
+          if [ "$EXPLICIT" = no ] && ! git -C espos merge-base --is-ancestor "$PINNED" "$TARGET"; then
+            skip "$TAG does not contain the pinned espOS commit $PINNED; not moving automatically."
+          fi
+          if git ls-remote --exit-code --heads origin "track-espos-$TAG" >/dev/null; then
+            # A branch with no PR is what a run that failed after its push
+            # leaves behind. Nobody can have reviewed it, so start over. Only
+            # here, once the run is sure to push the branch again.
+            echo "Removing track-espos-$TAG, left without a PR by an earlier run."
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/track-espos-$TAG"
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Move the submodule
+        id: bump
+        if: steps.target.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          OLD_IDF=$(cat .idf-version)
+          git -C espos checkout --quiet "$TAG"
+          NEW_IDF=$(cat espos/.idf-version)
+          # espOS's prologue refuses to configure when the two disagree, and CI
+          # reads .idf-version with no fallback: bump it, never delete it.
+          if [ "$OLD_IDF" != "$NEW_IDF" ]; then
+            printf '%s\n' "$NEW_IDF" > .idf-version
+            # The IDF version is also written out by hand in a few places. They
+            # do not break the build, so they are listed for the reviewer
+            # rather than rewritten blindly.
+            STALE=$(grep -nF -- "${OLD_IDF#v}" CMakeLists.txt README.md || true)
+            {
+              echo "idf_moved=true"
+              echo "old_idf=$OLD_IDF"
+              echo "new_idf=$NEW_IDF"
+              echo "stale<<EOF"
+              echo "$STALE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "idf_moved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # continue-on-error: a key whose App is not installed on this repository
+      # answers 404, and the bump must still go out with the workflow token.
+      - name: Get the App token for the PR
+        id: app-token
+        if: steps.target.outputs.skip == 'false' && env.APP_CONFIGURED == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # The Client ID is public (the App's settings page shows it), so it
+          # lives here; only the private key is a secret.
+          client-id: Iv23liXbDO1OUUwlQoNc
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the tracking PR
+        if: steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          AS_APP: ${{ steps.app-token.outputs.token != '' }}
+          TAG: ${{ steps.target.outputs.tag }}
+          PINNED: ${{ steps.target.outputs.pinned }}
+          IDF_MOVED: ${{ steps.bump.outputs.idf_moved }}
+          OLD_IDF: ${{ steps.bump.outputs.old_idf }}
+          NEW_IDF: ${{ steps.bump.outputs.new_idf }}
+          STALE: ${{ steps.bump.outputs.stale }}
+        run: |
+          set -euo pipefail
+          if [ "$APP_CONFIGURED" = true ] && [ "$AS_APP" != true ]; then
+            echo "::warning::RELEASE_APP_PRIVATE_KEY is set but gave no token" \
+                 "(is the App installed on $GITHUB_REPOSITORY?); opening the PR" \
+                 "with the workflow token instead"
+          fi
+          BRANCH="track-espos-$TAG"
+          OLD_DESC=$(git -C espos describe --tags "$PINNED" 2>/dev/null || echo "${PINNED:0:7}")
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add espos .idf-version
+          # fix: so release-please cuts a patch release once this merges.
+          git commit --quiet -m "fix: bump espOS to $TAG" \
+            -m "Moves the espos submodule from $OLD_DESC to $TAG."
+          git push --quiet \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$BRANCH"
+
+          # Built as a file, never interpolated into a shell string: the stale
+          # lines are text from files in the tree.
+          BODY="$RUNNER_TEMP/body.md"
+          {
+            echo "Moves espOS from \`$OLD_DESC\` to [\`$TAG\`](https://github.com/signalk-espOS/espOS/releases/tag/$TAG)."
+            echo
+            echo "Read the espOS release notes for anything marked **BREAKING**: the build proves the firmware compiles, not that it behaves the same."
+            echo
+            if [ "$IDF_MOVED" = true ]; then
+              echo "### ESP-IDF moved: $OLD_IDF → $NEW_IDF"
+              echo
+              echo "\`.idf-version\` is bumped. These lines still name the old version and are left for you to update:"
+              echo
+              echo '```'
+              echo "${STALE:-(none found)}"
+              echo '```'
+              echo
+            fi
+            echo "### Checks"
+            echo
+            if [ "$AS_APP" = true ]; then
+              echo "This PR's own CI builds the firmware for every target, which proves it compiles."
+            else
+              echo "Opened with the workflow token, so GitHub holds this PR's own checks until a maintainer approves them (**Approve workflows to run**)."
+            fi
+            echo
+            echo "Those images carry a throwaway signing key and are not published. Signed images come from the release that follows the merge."
+            echo
+            echo "Opened by \`.github/workflows/track-espos.yml\` ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+          } > "$BODY"
+
+          gh pr create --head "$BRANCH" --base main \
+            --title "fix: bump espOS to $TAG" --body-file "$BODY"
+
+      # The way Dependabot retires its own PRs: once a newer bump is open, an
+      # older one still open is noise, and merging it would only be undone by
+      # the next. Closed rather than left for a human to notice.
+      - name: Close the bumps this one supersedes
+        if: steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          EXPLICIT: ${{ steps.target.outputs.explicit }}
+        run: |
+          set -euo pipefail
+          # A tag named by hand may be a deliberate rollback or a side test,
+          # not the newest release, so it supersedes nothing.
+          if [ "$EXPLICIT" = yes ]; then
+            echo "$TAG was named by hand; superseding nothing."
+            exit 0
+          fi
+          # sort -V ranks v1.2.0-rc1 above v1.2.0, so a prerelease named by
+          # hand would "supersede" the real release. It closes nothing.
+          case "$TAG" in *-*) echo "$TAG is a prerelease; superseding nothing."; exit 0 ;; esac
+          NEW=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "track-espos-$TAG" \
+                  --state open --json number,isCrossRepository \
+                  --jq 'map(select(.isCrossRepository == false)) | .[0].number // empty')
+          if [ -z "$NEW" ]; then
+            echo "No open PR for $TAG; nothing to supersede."
+            exit 0
+          fi
+          BOT="41898282+github-actions[bot]@users.noreply.github.com"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 \
+              --json number,headRefName,isCrossRepository \
+              --jq '.[] | select(.isCrossRepository == false)
+                        | select(.headRefName | startswith("track-espos-v"))
+                        | "\(.number) \(.headRefName)"' |
+          while read -r NUM REF; do
+            OLD="${REF#track-espos-}"
+            [ "$OLD" = "$TAG" ] && continue
+            # Older releases only: a tag named by hand to roll back must not
+            # close the bump to a newer one.
+            # A prerelease of TAG itself is older, though sort -V ranks it above.
+            if [ "${OLD%%-*}" != "$TAG" ]; then
+              [ "$(printf '%s\n%s\n' "$OLD" "$TAG" | sort -V | tail -n1)" = "$TAG" ] || continue
+            fi
+            # One PR that cannot be closed (closed meanwhile, say) must not
+            # stop the rest, nor turn a run that opened its PR red.
+            if ! gh pr close "$NUM" --repo "$GITHUB_REPOSITORY" \
+                   --comment "Superseded by #$NEW, which moves espOS to $TAG."; then
+              echo "::warning::Could not close #$NUM."
+              continue
+            fi
+            # The branch goes too, unless someone pushed work onto it: a bump
+            # that needed hand-work may hold commits worth keeping. Committer as
+            # well as author, because an amend or rebase keeps the bot as author.
+            AUTHORS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$NUM/commits" \
+                        --jq '.[] | .commit.author.email, .commit.committer.email' \
+                        | sort -u) || AUTHORS=unknown
+            if [ "$AUTHORS" = "$BOT" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$REF" \
+                || echo "::warning::Could not delete $REF."
+            else
+              echo "Kept $REF: it carries commits beyond the bump."
+            fi
+          done

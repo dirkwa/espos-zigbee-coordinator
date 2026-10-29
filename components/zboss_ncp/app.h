@@ -1,0 +1,64 @@
+#pragma once
+#include <esp_err.h>
+
+#include <freertos/FreeRTOS.h>
+#include <sys/queue.h>
+
+// The partition the NCP keeps its own NVS data in (UPSTREAM.md).
+#define ZB_NVS_PARTITION "zb_nvs"
+
+class app {
+public:
+	enum event_t : uint16_t {
+	   EVENT_INPUT,                /*!< Input event from NCP to host */
+	   EVENT_OUTPUT,               /*!< Output event from host to NCP */
+	   EVENT_RESET,                /*!< Reset event from host to NCP */
+	   EVENT_LINK_RESET,           /*!< A host qualified: switch to it (size = its generation) */
+	   EVENT_BOOT_READY,           /*!< The stack is up: send the boot-ready frame */
+	};
+	struct ctx_t {
+		event_t event;	/*!< The event between the host and NCP */
+		uint16_t size;	/*!< Data size on the event */
+	};
+private:
+	app();
+	static app& instance();
+	esp_err_t send_event_int(const ctx_t& ctx);
+	esp_err_t post_event_int(const ctx_t& ctx, TickType_t wait);
+	esp_err_t init_int();
+	esp_err_t start_int();
+
+	esp_err_t process_event(const ctx_t& ctx);
+	static void task(void*);
+	[[noreturn]] void run();
+	static constexpr size_t EVENT_QUEUE_LEN = 60;
+	static constexpr size_t TIMEOUT_MS  = 10;
+	// Upstream runs this loop on the main task; espOS's app_main returns.
+	static constexpr size_t APP_TASK_STACK = 1024*6;
+	static constexpr UBaseType_t APP_TASK_PRIORITY = 5;
+
+	// Sized to the LARGER of the two directions multiplexed through m_buffer in
+	// process_event:
+	//   - host->NCP read chunk = transport::BUF_SIZE       (1024)
+	//   - NCP->host frame       = protocol::MAX_FRAME_SIZE  (2048; full 64-entry
+	//                             Mgmt_Lqi / Mgmt_Bind responses)
+	// Undersizing strands oversize NCP->host frames in transport's message
+	// buffer, which then blocks every frame behind them (H1). The static_assert
+	// in app.cpp ties this to protocol's value so the two layers can't drift.
+	static constexpr size_t BUFFER_SIZE = 2048;
+
+	QueueHandle_t m_queue; 
+	uint8_t m_buffer[BUFFER_SIZE];
+
+public:
+	
+	static esp_err_t send_event(const ctx_t& ctx){ return instance().send_event_int(ctx); }
+	// For a task that may wait for room, never the ZBOSS task (see
+	// send_event_int): waits up to `wait` and does not log a full queue.
+	static esp_err_t post_event(const ctx_t& ctx, TickType_t wait){ return instance().post_event_int(ctx, wait); }
+
+	static esp_err_t init();
+	static esp_err_t start();
+
+	static void on_rx_data(const void* data, size_t size);
+};

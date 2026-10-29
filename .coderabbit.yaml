@@ -1,0 +1,49 @@
+language: en-US
+
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+      - "chore: release"
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "github-actions[bot]"
+
+  path_filters:
+    - "!managed_components/**"
+    - "!build*/**"
+    - "!espos/**"
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        espos-zigbee-coordinator is ESP-IDF firmware on espOS (the espos/
+        submodule): a Zigbee coordinator on an ESP32-C5/C6 that serves the
+        ZBOSS NCP protocol to Zigbee2MQTT over TCP. components/zboss_ncp is
+        vendored from tostmann/esp-coordinator (UPSTREAM.md lists the local
+        changes). There are no host tests here: the gate is a warning-free
+        build for every target in ci.yml, and behaviour is verified on
+        hardware.
+
+        Flag: a generic fix (WiFi, config, OTA, mDNS, web UI) made here
+        instead of in espOS; any NCP path that reads, erases or writes
+        espOS's "nvs" partition instead of "zb_nvs"; host frames reaching
+        the wrong TCP client or out of order across a reconnect; protocol
+        link state touched from a task other than the app task; a local change
+        to zboss_ncp missing from UPSTREAM.md; a partition table change
+        presented as reaching fielded devices by OTA; committed credentials
+        or LAN addresses; comments that restate the code; version bumps
+        outside the release PR; AI attribution in commits or PR text.
+
+knowledge_base:
+  linked_repositories:
+    - repository: signalk-espOS/espOS
+      instructions: >-
+        The runtime pinned as the espos/ submodule: the prologue
+        (cmake/espos_project.cmake), the partition tables and their rules
+        (docs/hardware.md), espos_mdns, and the reusable build-firmware.yml
+        this repo's release calls with the signing key and Docker Hub
+        secrets.

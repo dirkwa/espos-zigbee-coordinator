@@ -1,0 +1,254 @@
+#include "app.h"
+#include "boot_guard.h"
+#include "transport.h"
+#include "protocol.h"
+#include "zb_ncp.h"
+#include <nvs_flash.h>
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <cstdint>
+
+static const char* TAG = "APP";
+
+app::app() {
+
+}
+
+app& app::instance() {
+	static app s_app;
+	return s_app;
+}
+
+void app::on_rx_data(const void* data, size_t size) {
+	zb_ncp::on_rx_data(data,size);
+}
+
+esp_err_t app::send_event_int(const ctx_t& ctx) {
+	//ESP_LOGI(TAG,"send event %d %d",ctx.event,ctx.size);
+	BaseType_t ret = pdTRUE;
+    if (xPortInIsrContext() == pdTRUE) {
+        ret = xQueueSendFromISR(m_queue, &ctx, NULL);
+    } else {
+        // MUST stay non-blocking (timeout 0): this path is reached from the
+        // ZBOSS task via send_cmd_data -> protocol::send_data ->
+        // transport::send, and ZBOSS invokes that from INSIDE its
+        // zb_osif_disable_all_interrupts/enable critical window (MAC logic
+        // iteration). A blocking xQueueSend here lets the scheduler switch
+        // away inside the critical section and corrupts the per-CPU critical
+        // nesting count -> vPortExitCritical assert panic on ncp_zb_task
+        // (reproduced on the wifi-coex branch 2026-06-06). Callers that CAN
+        // safely wait (the transport RX tasks) implement their own bounded
+        // wait instead (post_event).
+        ret = xQueueSend(m_queue, &ctx, 0);
+        if (ret != pdTRUE) {
+            ESP_LOGE(TAG, "event queue full, event %d (size %u) dropped",
+                     ctx.event, (unsigned)ctx.size);
+        }
+    }
+	
+    return (ret == pdTRUE) ? ESP_OK : ESP_FAIL ;
+}
+
+esp_err_t app::post_event_int(const ctx_t& ctx, TickType_t wait) {
+	return xQueueSend(m_queue, &ctx, wait) == pdTRUE ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t app::process_event(const ctx_t& ctx) {
+	// H1: m_buffer carries BOTH directions (EVENT_INPUT = NCP->host frame,
+	// EVENT_OUTPUT = host->NCP chunk). It must hold the largest protocol frame
+	// or transport cannot drain such a frame, and it blocks every frame
+	// queued behind it.
+	static_assert(BUFFER_SIZE >= protocol::MAX_FRAME_SIZE,
+	              "app::BUFFER_SIZE must cover protocol::MAX_FRAME_SIZE (H1)");
+	size_t recv_size = 0;
+    esp_err_t ret = ESP_OK;
+
+    // Only EVENT_OUTPUT reads ctx.size bytes into m_buffer.
+    if (ctx.event == EVENT_OUTPUT && ctx.size > sizeof(m_buffer)) {
+        ESP_LOGE(TAG, "Process event out of memory %d",ctx.size);
+        return ESP_ERR_NO_MEM;
+    }
+
+    switch (ctx.event) {
+        case EVENT_INPUT:
+        	transport::process_input(m_buffer, sizeof(m_buffer), 2);
+            break;
+        case EVENT_OUTPUT:
+            recv_size = transport::output_receive(m_buffer,ctx.size);
+			if (recv_size != ctx.size) {
+                ESP_LOGE(TAG, "Output buffer receive error: size %d expect %d!", recv_size, ctx.size);
+            } else {
+                //ESP_LOGD(TAG,"esp_ncp_bus_output %d",ctx->size);
+                ret = protocol::on_rx(m_buffer, ctx.size);
+            }
+            break;
+        case EVENT_RESET: {
+            // The NCP_RESET request handler posts EVENT_RESET from
+            // process_status_arg BEFORE immediate_cmd_process::process gets
+            // to call send_cmd_data — so the actual NCP_RESET response is
+            // queued in m_queue as EVENT_INPUT BEHIND this EVENT_RESET.
+            //
+            // Drain remaining queue entries first so any pending response
+            // (most importantly the OK reply to the very NCP_RESET request
+            // that triggered this reset) goes out via usb_serial_jtag_write_bytes
+            // before we reboot. Without the drain z2m's reset() promise
+            // times out (no matching-tsn response) and z2m exits with
+            // "Failed to start zigbee-herdsman".
+            //
+            // Then a short delay lets the USB-Serial-JTAG controller actually
+            // shift the queued bytes out onto the wire before esp_restart()
+            // yanks the rug — usb_serial_jtag_write_bytes returns once the
+            // bytes are accepted into the driver's TX ring, not after they
+            // are transmitted.
+            ctx_t pending;
+            while (xQueueReceive(m_queue, &pending, 0) == pdTRUE) {
+                process_event(pending);
+            }
+            transport::process_input(m_buffer, sizeof(m_buffer), SIZE_MAX);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            transport::restart();
+        } break;
+        case EVENT_LINK_RESET:
+            transport::on_link_reset(ctx.size);
+            break;
+        case EVENT_BOOT_READY:
+            transport::poll_boot_ready(m_buffer, sizeof(m_buffer));
+            break;
+        default:
+            break;
+    }
+
+    return ret;
+}
+
+esp_err_t app::init_int() {
+	ESP_LOGI(TAG,"init_int");
+
+	auto res = protocol::init();
+	if (res != ESP_OK)
+		return res;
+	res = transport::init();
+	if (res != ESP_OK)
+		return res;
+	m_queue = xQueueCreate(EVENT_QUEUE_LEN, sizeof(ctx_t));
+	if (!m_queue) {
+		return ESP_ERR_NO_MEM;
+	}
+	return ESP_OK;
+}
+
+esp_err_t app::start_int() {
+	ESP_LOGV(TAG,"start_int");
+	auto res = transport::start();
+	if (res != ESP_OK)
+		return res;
+
+    // The boot-time framing ACK upstream sends here goes to each host as it
+    // connects instead (transport::add_candidate): over TCP no host is
+    // listening at boot.
+
+    if (boot_guard::safe_mode()) {
+        // WEDGE-1 safe mode: repeated early-boot failures — bring up the
+        // host link WITHOUT the ZBOSS stack so the stick stays reachable and
+        // recoverable (dispatch restricted in zb_ncp::on_rx_data). Send the
+        // boot-ready frame here since continue_zboss will never run; hosts
+        // then fail visibly on GENERIC_BLOCKED getters instead of a silent
+        // open-port timeout. NO early return — the event pump at the end of
+        // this function is what drains m_queue (incl. these very frames and
+        // every command response); returning here would leave the link mute.
+        ESP_LOGE(TAG, "boot guard SAFE MODE: ZBOSS not started");
+        zb_ncp::send_boot_ready_frame();
+    } else {
+        // Cold-boot panID race: start the ZBOSS dispatch task here, after the
+        // transport polling task is up and the event loop is about to drain
+        // m_queue. Triggers zboss_main_loop -> SKIP_STARTUP -> continue_zboss,
+        // which sends the synthetic NCP_RESET response and kicks off
+        // NETWORK_STEERING so the persisted NVRAM-stored network is actually
+        // active by the time z2m's first GET_JOINED query arrives. Without this
+        // the task only spins up lazily when the host issues NWK_FORMATION /
+        // NWK_START_WITHOUT_FORMATION — but z2m doesn't issue those at startup
+        // (it queries first), and on stale defaults it formNetwork()s and wipes
+        // every paired device.  See andryblack/esp-coordinator#5/#19, z2m #26152.
+        zb_ncp::start_zigbee_stack();
+    }
+
+    // The synthetic NCP_RESET *response* (cmd=0x0002, tsn=0xFF, status=OK)
+    // used to be sent here, but doing so before ZBOSS finished loading its
+    // NVRAM made z2m proceed to needsToBeInitialised() too early:
+    // GET_PAN_ID / GET_EXTENDED_PAN_ID / GET_ZIGBEE_CHANNEL returned the
+    // uninitialised defaults (0xFFFF / 0xFF), z2m saw a "different" network
+    // than its configured options, and called formNetwork() — which trashes
+    // the entire device DB.  See andryblack/esp-coordinator#5 (z2m #26152)
+    // for the original report and #19 for the regression confirming PR #6's
+    // 'move zboss_start_no_autostart() into init_int()' alone wasn't
+    // sufficient: the NVRAM load itself only completes inside zboss_main_loop
+    // (on the dedicated ZBOSS FreeRTOS task), and we used to race against
+    // that here.  The boot-ready frame is now sent from zb_ncp::continue_zboss,
+    // which is scheduled from the ZB_ZDO_SIGNAL_SKIP_STARTUP handler — the
+    // earliest signal at which the dataset is guaranteed loaded and
+    // zb_get_pan_id() returns the persisted value.
+
+ 	// uint8_t outdata[2] = { 0,0 };
+    // esp_ncp_header_t header = {{0,0,0,},NCP_RESET,0,0};
+    // esp_ncp_resp_input(&header, outdata, sizeof(outdata)); 
+
+	if (xTaskCreate(&app::task, "ncp_app", APP_TASK_STACK, this, APP_TASK_PRIORITY, NULL) != pdTRUE) {
+		return ESP_ERR_NO_MEM;
+	}
+	return ESP_OK;
+}
+
+void app::task(void* arg) {
+	static_cast<app*>(arg)->run();
+}
+
+void app::run() {
+	ctx_t ctx;
+    while (true) {
+        // Bounded wait so the request watchdog runs even on an idle link; on a
+        // busy link it runs after each event (self-rate-limited internally).
+        if (xQueueReceive(m_queue, &ctx, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            if (process_event(ctx) != ESP_OK) {
+                // Per-event failure must not tear down the NCP link — a transient
+                // stream-buffer or oversize-packet error on one ctx is independent
+                // of the next. Pre-fix this loop would `break`, returning to
+                // app_main which then ended the main task and left the host with
+                // an open serial port that never answered again.
+                ESP_LOGE(TAG, "Process event fail");
+            }
+        }
+        zb_ncp::request_watchdog_tick();
+        if (uxQueueMessagesWaiting(m_queue) == 0) {
+            transport::process_input(m_buffer, sizeof(m_buffer), SIZE_MAX);
+        }
+        transport::poll_boot_ready(m_buffer, sizeof(m_buffer));
+    }
+}
+
+esp_err_t app::init() {
+	ESP_LOGI(TAG,"init");
+	// The coordinator's own NVS partition: espOS keeps its settings, Wi-Fi
+	// credentials and keys in "nvs", which a network backup must neither
+	// export nor overwrite. An image a restore left unmountable is erased,
+	// as upstream does for its "nvs", instead of failing the boot.
+	auto res = nvs_flash_init_partition(ZB_NVS_PARTITION);
+	if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		ESP_LOGW(TAG, "nvs_flash_init_partition: %s -- erasing and retrying", esp_err_to_name(res));
+		nvs_flash_erase_partition(ZB_NVS_PARTITION);
+		res = nvs_flash_init_partition(ZB_NVS_PARTITION);
+	}
+	if (res != ESP_OK)
+		return res;
+	res = zb_ncp::init();
+	if (res != ESP_OK) {
+		return res;
+	}
+	return instance().init_int();
+}
+
+
+esp_err_t app::start() {
+	ESP_LOGI(TAG,"start");
+	return instance().start_int();;
+}

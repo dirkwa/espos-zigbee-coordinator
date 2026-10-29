@@ -1,0 +1,109 @@
+# Cuts releases from the history, the way espOS does: a push to main that
+# carries a change users get (the gate below) refreshes a "chore: release
+# x.y.z" pull request carrying the changelog and the version.txt bump, and
+# merging that PR tags and publishes the release. feat bumps minor, fix bumps
+# patch, a `!` bumps major. The changelog is the release notes GitHub
+# generates for the merged pull requests, each with its author and a link to
+# it, sorted by the labels label-by-title.yml sets (.github/release.yml).
+#
+# A release created here is created with the workflow's own token, and
+# GitHub never lets such an event start another workflow -- so the
+# firmware build, signing and asset upload are called directly rather
+# than left to release-firmware.yml's `release:` trigger.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  # A change to the release configuration is a ci merge, which the gate stops,
+  # so a manual run is what rewrites the open release PR against it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # GitHub's release notes are never empty -- they always end in a "Full
+  # Changelog" link -- so release-please, which skips a release only when its
+  # notes are empty, would propose one after every merge, a docs or ci change
+  # included. Only a push carrying a change users get goes on: feat, fix,
+  # perf, refactor or revert, a breaking change whatever its type, a
+  # `Release-As:` footer, and the merge of the release PR itself, which is what
+  # creates the tag. The payload holds at most 2048 commits, so a push that
+  # fills it may hide more and is let through.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      releasable: ${{ steps.check.outputs.releasable }}
+    steps:
+      # A manual run carries no commits of its own, so it judges every commit
+      # since the last release instead. With no tag for the manifest's version
+      # (the first release, or a merged release PR never tagged) it goes on.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: check
+        env:
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
+          MESSAGES: ${{ toJSON(github.event.commits.*.message) }}
+          RELEASABLE: '^((feat|fix|perf|refactor|revert)(\([^)]*\))?!?: |[a-z]+(\([^)]*\))?!: |Revert |chore: release v?[0-9])'
+        run: |
+          if [ "$DISPATCHED" = true ]; then
+            last="v$(jq -er '."."' .release-please-manifest.json)"
+            if ! git rev-parse -q --verify "refs/tags/$last" > /dev/null; then
+              echo "releasable=true" >> "$GITHUB_OUTPUT"
+              echo "No tag $last; release-please not gated."
+              exit 0
+            fi
+            MESSAGES=$(git log -z --format=%B "$last..HEAD" | jq -Rs 'split("\u0000") | map(select(. != ""))')
+            echo "Judging the $(jq length <<< "$MESSAGES") commits since $last."
+          fi
+          if jq -e --arg re "$RELEASABLE" '(length >= 2048) or ([.[] | (split("\n")[0] | test($re)) or test("\nBREAKING[- ]CHANGE: ") or test("\nRelease-As: ")] | any)' <<< "$MESSAGES" > /dev/null; then
+            echo "releasable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "releasable=false" >> "$GITHUB_OUTPUT"
+            echo "No releasable commit; release-please not run."
+          fi
+
+  release-please:
+    needs: gate
+    if: needs.gate.outputs.releasable == 'true'
+    # One at a time: a push and a manual run could both find the merged
+    # release PR untagged and both try to create its release.
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  firmware:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-firmware.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    # `inherit` is load-bearing.
+    #
+    # release-firmware.yml reads `secrets.ZIGBEE_COORDINATOR_SIGNING_KEY_PEM` by name,
+    # and a repository secret is NOT automatically visible inside a called
+    # workflow -- the caller has to make it available, and `inherit` is what
+    # does that. Remove it and the key reads empty, the build falls back to a
+    # per-run throwaway, and the release installs over USB and then refuses
+    # every OTA. Silently, because an unsigned build still succeeds.
+    secrets: inherit

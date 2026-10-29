@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# CI builds the firmware, and a run takes minutes. One run per ref,
+# superseded ones cancelled: a new push to a branch makes the run already in
+# flight for it pointless. main keys on the commit so a merge's own run is
+# never cancelled by the push that follows it.
+concurrency:
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The chips release-firmware.yml ships: the ones with an 802.15.4
+        # radio beside their Wi-Fi.
+        target: [esp32c5, esp32c6]
+    steps:
+      # fetch-depth: 0 because the version baked into the image comes from
+      # `git describe`, and checkout's default depth of 1 fetches no tags in
+      # this repository or in the espOS submodule. Without it describe answers
+      # with a bare hash, espos_version.cmake rejects that and falls back to
+      # version.txt, so every build between two releases claims to BE that
+      # release; and the build log cannot say which espOS is in the image.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: read pinned IDF version
+        id: idf
+        run: echo "version=$(cat .idf-version)" >> "$GITHUB_OUTPUT"
+
+      # Docker Hub caps anonymous image pulls per runner IP, and the shared
+      # GitHub runners hit that cap often enough to fail whole matrix legs
+      # before they compile. Logging in gives the run an account's own
+      # allowance. Without the variable, or when the login itself fails (a
+      # revoked token, a fork without the secret), the pull is anonymous as
+      # before rather than the leg failing here.
+      - name: log in to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # CMake generates a throwaway signing key when none is present, which is
+      # right for CI: these images are never released. A real release must
+      # restore the project key from a secret (espos/docs/ota.md) - a build
+      # signed with a per-run key installs over USB and then rejects every OTA.
+      - uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
+        with:
+          esp_idf_version: ${{ steps.idf.outputs.version }}
+          target: ${{ matrix.target }}
+          # Kept as build.log for the warning gate below. pipefail, or tee's
+          # exit status would hide a failed build.
+          command: set -o pipefail; idf.py build 2>&1 | tee build.log
+
+      # Zero warnings is the gate (AGENTS.md), and idf.py build succeeds with
+      # compiler, linker and CMake warnings alike. The one expected warning is
+      # the development signing key above; CMake wraps its text over several
+      # lines, so each CMake warning is read with the lines that follow it.
+      - name: fail on build warnings
+        run: |
+          set -euo pipefail
+          found=$(sed 's/\x1b\[[0-9;]*[mK]//g' build.log | awk '
+            pending {
+              text = text " " $0
+              if (++n == 3) {
+                gsub(/[ \t]+/, " ", text)
+                if (text !~ /generating a development RSA-3072 signing key/) print text
+                pending = 0
+              }
+              next
+            }
+            /CMake Warning/ { pending = 1; text = $0; n = 0; next }
+            /warning:/ { print }
+            END { if (pending) print text }
+          ')
+          if [ -n "$found" ]; then
+            printf '%s\n' "$found"
+            echo "::error::the ${{ matrix.target }} build has warnings"
+            exit 1
+          fi
+          echo "no build warnings"
+
+      # The web UI is a committed bundle in espOS (no Node here); this checks
+      # it was packed into the LittleFS image rather than left out silently.
+      - name: check the UI made it into the image
+        run: test -s build/storage.bin

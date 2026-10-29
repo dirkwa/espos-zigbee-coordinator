@@ -1,0 +1,48 @@
+# The changelog is generated from pull request titles (release-please, see
+# release-please.yml), so a title that is not a Conventional Commit is a
+# change that never appears in the notes. Same check as espOS.
+#
+# pull_request, not pull_request_target: the check only reads the title, which
+# the read-only token a fork's pull request gets is enough for, and from
+# 2026-11-02 GitHub blocks pull_request_target on public repositories by
+# default.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  conventional-title:
+    name: title is a Conventional Commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            revert
+            docs
+            test
+            build
+            ci
+            chore
+          requireScope: false
+          # A digit or symbol may lead ("10.1-inch panel"), a capital may not,
+          # and 50 characters keeps the changelog entry on one line (AGENTS.md).
+          # Bots write their own titles and cannot be asked to shorten them:
+          # Dependabot names the package and both versions, and its ci bumps
+          # stay out of the changelog anyway.
+          subjectPattern: ${{ github.event.pull_request.user.type == 'Bot' && '^(?![A-Z]).+$' || '^(?![A-Z]).{1,50}$' }}
+          subjectPatternError: >-
+            The subject "{subject}" must not start with a capital letter and
+            must be at most 50 characters, e.g. "fix(upload): retry on 503".
+            The title becomes the changelog entry.

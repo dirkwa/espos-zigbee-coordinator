@@ -1,0 +1,6 @@
+## The Zigbee stack the NCP drives. esp-coordinator builds against the 1.6
+## line; esp-zigbee-sdk 2.x changed the API it uses.
+dependencies:
+  espressif/esp-zigbee-lib: "~1.6.0"
+  espressif/esp-zboss-lib: "~1.6.0"
+  idf: ">=6.0.0"
