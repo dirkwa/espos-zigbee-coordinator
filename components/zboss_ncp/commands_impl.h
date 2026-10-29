@@ -2927,6 +2927,20 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
                 // failure; the host can retry the whole RESTORE_STRUCTURED.
                 ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: zb erase failed: %s",
                          esp_err_to_name(ze));
+                // The image is already stored; a later boot would replay it
+                // over the storage that failed to erase.
+                nvs_handle_t pending;
+                esp_err_t pe = nvs_open_from_partition(ZB_NVS_PARTITION, "restore_pend",
+                                                       NVS_READWRITE, &pending);
+                if (pe == ESP_OK) {
+                    pe = nvs_erase_key(pending, "tlv");
+                    if (pe == ESP_OK) pe = nvs_commit(pending);
+                    nvs_close(pending);
+                }
+                if (pe != ESP_OK) {
+                    ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: pending image not removed: %s",
+                             esp_err_to_name(pe));
+                }
                 return reply(outdata, GENERIC_OPERATION_FAILED);
             }
         } else {

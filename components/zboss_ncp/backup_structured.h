@@ -77,7 +77,8 @@ static constexpr size_t MAX_IMAGE_SIZE = 8 + 80 + 3 + MAX_DEVICES * 16 + 16;
 
 // An image a restore can be built from: the header matches, the TLVs fill
 // the payload exactly, every known tag has its length, and the network's
-// identity (PAN ID, extended PAN ID, channel) is there. Checked before the
+// identity (PAN ID, extended PAN ID, channel, network key) is there:
+// without the key, paired devices cannot rejoin the restored network. Checked before the
 // stack storage is erased and again before replay, so a truncated or empty
 // image never leads to forming a network with default parameters.
 inline bool image_valid(const uint8_t* img, size_t size) {
@@ -90,7 +91,7 @@ inline bool image_valid(const uint8_t* img, size_t size) {
     }
     const uint8_t* p = img + sizeof(hdr);
     const uint8_t* end = p + hdr.payload_len;
-    bool pan = false, ext_pan = false, channel = false;
+    bool pan = false, ext_pan = false, channel = false, key = false;
     while (p < end) {
         if (end - p < 3) return false;
         const uint8_t tag = p[0];
@@ -107,7 +108,7 @@ inline bool image_valid(const uint8_t* img, size_t size) {
                                         break;
             case TAG_NWK_UPDATE_ID:     want = 1;  break;
             case TAG_COORD_IEEE:        want = 8;  break;
-            case TAG_NWK_KEY:           want = 16; break;
+            case TAG_NWK_KEY:           want = 16; key = true; break;
             case TAG_NWK_KEY_SEQ:       want = 1;  break;
             case TAG_NWK_FRAME_COUNTER: want = 4;  break;
             default:                    want = len; break;
@@ -115,7 +116,7 @@ inline bool image_valid(const uint8_t* img, size_t size) {
         if (len != want) return false;
         p += len;
     }
-    return pan && ext_pan && channel;
+    return pan && ext_pan && channel && key;
 }
 
 } // namespace backup_structured
