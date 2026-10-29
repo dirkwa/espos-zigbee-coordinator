@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 (2026-10-29)
+
+<!-- Release notes generated using configuration in .github/release.yml at main -->
+
+## What's Changed
+### Added
+* feat: advertise the device id over mdns by @dirkwa in https://github.com/dirkwa/espos-zigbee-coordinator/pull/9
+### Fixed
+* fix: bump espOS to v0.25.1 by @dirkwa in https://github.com/dirkwa/espos-zigbee-coordinator/pull/7
+
+
+**Full Changelog**: https://github.com/dirkwa/espos-zigbee-coordinator/compare/v0.1.1...v0.2.0
+
 ## 0.1.1 (2026-10-29)
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
