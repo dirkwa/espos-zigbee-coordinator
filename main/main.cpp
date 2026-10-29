@@ -12,10 +12,13 @@
  * Zigbee2MQTT finds it with `serial.port: mdns://espos-zigbee`, or takes
  * `tcp://<device>:6638` directly, with `serial.adapter: zboss`.
  */
+#include <cstdio>
+
 #include "esp_err.h"
 #include "esp_log.h"
 #include "espos.h"
 #include "espos_mdns.h"
+#include "espos_net.h"
 #include "sdkconfig.h"
 #include "zboss_ncp.h"
 
@@ -36,10 +39,16 @@ extern "C" void app_main(void) {
 
   /* herdsman's mDNS discovery takes the first service of the type it is
    * given and reads the adapter from radio_type; the Zigbee2MQTT frontend
-   * lists every service that carries it. */
-  static const char* const kTxt[] = {"radio_type=zboss"};
-  err = espos_mdns_add_service("_espos-zigbee", "_tcp", CONFIG_ZBOSS_NCP_TCP_PORT, kTxt,
-                               sizeof(kTxt) / sizeof(kTxt[0]));
+   * lists every service that carries it. id is the espOS device id that
+   * _espos._tcp carries too: the signalk-zigbee plugin keys coordinators by
+   * it and matches a configured one by it, so a renamed device or a new DHCP
+   * lease is still the same coordinator. espos_mdns copies the strings. */
+  const char* id = espos_net_short_id();
+  char id_kv[24];
+  snprintf(id_kv, sizeof(id_kv), "id=%s", id);
+  const char* const txt[] = {"radio_type=zboss", id_kv};
+  err = espos_mdns_add_service("_espos-zigbee", "_tcp", CONFIG_ZBOSS_NCP_TCP_PORT, txt,
+                               id[0] != '\0' ? 2 : 1);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "not advertised over mDNS (%s): use tcp://<device>:%d", esp_err_to_name(err),
              CONFIG_ZBOSS_NCP_TCP_PORT);
