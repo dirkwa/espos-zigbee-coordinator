@@ -26,7 +26,9 @@
 // APS per-peer frame counters are likewise not exported — devices that
 // strictly enforce APS-level replay rejection may briefly re-sync.
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace backup_structured {
 
@@ -72,5 +74,48 @@ static constexpr size_t MAX_DEVICES = 64;
 
 // 8 + (network section ~80) + 3 + MAX_DEVICES*16 + a little slack.
 static constexpr size_t MAX_IMAGE_SIZE = 8 + 80 + 3 + MAX_DEVICES * 16 + 16;
+
+// An image a restore can be built from: the header matches, the TLVs fill
+// the payload exactly, every known tag has its length, and the network's
+// identity (PAN ID, extended PAN ID, channel) is there. Checked before the
+// stack storage is erased and again before replay, so a truncated or empty
+// image never leads to forming a network with default parameters.
+inline bool image_valid(const uint8_t* img, size_t size) {
+    header_t hdr;
+    if (size < sizeof(hdr)) return false;
+    memcpy(&hdr, img, sizeof(hdr));
+    if (memcmp(hdr.magic, MAGIC, 4) != 0 || hdr.version != VERSION ||
+        hdr.payload_len == 0 || sizeof(hdr) + hdr.payload_len > size) {
+        return false;
+    }
+    const uint8_t* p = img + sizeof(hdr);
+    const uint8_t* end = p + hdr.payload_len;
+    bool pan = false, ext_pan = false, channel = false;
+    while (p < end) {
+        if (end - p < 3) return false;
+        const uint8_t tag = p[0];
+        uint16_t len;
+        memcpy(&len, p + 1, 2);
+        p += 3;
+        if (len > end - p) return false;
+        size_t want = 0;
+        switch (tag) {
+            case TAG_PAN_ID:            want = 2;  pan = true; break;
+            case TAG_EXT_PAN_ID:        want = 8;  ext_pan = true; break;
+            case TAG_CHANNEL:           want = 1;
+                                        channel = len == 1 && p[0] >= 11 && p[0] <= 26;
+                                        break;
+            case TAG_NWK_UPDATE_ID:     want = 1;  break;
+            case TAG_COORD_IEEE:        want = 8;  break;
+            case TAG_NWK_KEY:           want = 16; break;
+            case TAG_NWK_KEY_SEQ:       want = 1;  break;
+            case TAG_NWK_FRAME_COUNTER: want = 4;  break;
+            default:                    want = len; break;
+        }
+        if (len != want) return false;
+        p += len;
+    }
+    return pan && ext_pan && channel;
+}
 
 } // namespace backup_structured

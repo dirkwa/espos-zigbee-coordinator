@@ -25,8 +25,17 @@ Copied from upstream's `main/`, then changed for espOS. Every local change:
   `protocol::reply_scope`). Every link reset starts a new epoch. A pending
   request records the epoch it arrived in, and a reply sent from a ZBOSS
   callback runs under that epoch: `send_data` drops it once the link has
-  been reset, and a previous host's slot is freed rather than matched, so a
-  late callback cannot answer a new host's request that reused its tsn.
+  been reset. A previous host's slot stays taken until its callback comes
+  and is then freed without an answer, and a callback whose tsn two slots
+  share goes to the older one, so it cannot answer a newer request.
+- **Fixes in upstream's handlers**, to be offered upstream:
+  `RESTORE_STRUCTURED_BACKUP` and the restore replay accept only a complete
+  image (`backup_structured::image_valid`) before erasing `zb_storage` or
+  forming; a failed BDB start or ZBOSS task creation answers the pending
+  `NWK_FORMATION` / `NWK_START_WITHOUT_FORMATION` with an error; host
+  channel masks outside 11-26 or empty are refused; the Simple_Desc_rsp
+  intercept leaves a success body under 8 bytes to the stack and reads the
+  output clusters after the whole input list when it caps the counts.
 - **Host bytes in chunks of at most `BUF_SIZE`** (`transport::rx_pump`),
   which is `protocol::RX_BUFFER_SIZE`. A promotion pumps a read plus the
   scanned header tail, and a larger chunk overflows `protocol::on_rx`. A

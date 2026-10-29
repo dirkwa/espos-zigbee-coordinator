@@ -88,6 +88,11 @@ static void apply_pending_restore() {
         free(buf);
         return;
     }
+    if (!backup_structured::image_valid(buf, blob_size)) {
+        ESP_LOGE(TAG, "apply_pending_restore: malformed or incomplete TLV image, not applied");
+        free(buf);
+        return;
+    }
 
     ESP_LOGI(TAG, "apply_pending_restore: replaying %u-byte payload", hdr.payload_len);
 
@@ -247,6 +252,12 @@ esp_err_t zb_ncp::init_int() {
     return ESP_OK;
 }
 
+bool zb_ncp::channel_mask_valid(uint32_t mask) {
+	// Only channels 11-26 exist at 2.4 GHz, and an empty mask leaves
+	// formation nothing to scan.
+	return mask != 0 && (mask & ~uint32_t(ZB_TRANSCEIVER_ALL_CHANNELS_MASK)) == 0;
+}
+
 void zb_ncp::set_channel_mask(uint32_t mask) {
 	instance().m_channels_mask = mask;
 	zb_set_channel_mask(mask);
@@ -273,18 +284,17 @@ void zb_ncp::ncp_zb_task(void* arg) {
     vTaskDelete(NULL);
 }
 
-bool zb_ncp::start_zigbee_stack() {
-	if (!s_init_flag) {
-            
-        ESP_LOGI(TAG,"Start Zigbee task");
-
-        xTaskCreate(&zb_ncp::ncp_zb_task, "ncp_zb_task", ZB_TASK_STACK_SIZE, NULL, 5, NULL);
-
-        s_init_flag = true;
-        return true;
-    } else {
-        return false;
-    }
+zb_ncp::stack_start_t zb_ncp::start_zigbee_stack() {
+	if (s_init_flag) {
+		return stack_start_t::RUNNING;
+	}
+	ESP_LOGI(TAG,"Start Zigbee task");
+	if (xTaskCreate(&zb_ncp::ncp_zb_task, "ncp_zb_task", ZB_TASK_STACK_SIZE, NULL, 5, NULL) != pdPASS) {
+		ESP_LOGE(TAG,"Zigbee task not created");
+		return stack_start_t::FAILED;
+	}
+	s_init_flag = true;
+	return stack_start_t::STARTED;
 }
 
 // ZBOSS "big lock" — the esp-zboss-lib port layer's recursive mutex
@@ -620,7 +630,9 @@ void zb_ncp::continue_zboss(uint8_t arg) {
         // PIB-cache preset in apply_pending_restore (TAG_CHANNEL).
         ESP_LOGI(TAG, "continue_zboss: restore applied, forcing NETWORK_FORMATION");
         set_channel_mask(instance().m_channels_mask);
-        bdb_start_top_level_commissioning(ZB_BDB_NETWORK_FORMATION);
+        if (!bdb_start_top_level_commissioning(ZB_BDB_NETWORK_FORMATION)) {
+            ESP_LOGE(TAG, "continue_zboss: restore formation did not start");
+        }
     } else {
         // BOOT-1: plain boot (no pending formation, no restore). Run ONLY the
         // BDB initialization machine: commissioned -> network resume from
@@ -636,7 +648,10 @@ void zb_ncp::continue_zboss(uint8_t arg) {
         // (NWK_PERMIT_JOINING / ZDO_PERMIT_JOINING_REQ). Note: remote devices
         // broadcasting Mgmt_Permit_Joining after THEIR steering still open us
         // for 180 s — that is spec-compliant Zigbee and unaffected here.
-        bdb_start_top_level_commissioning(ZB_BDB_INITIALIZATION);
+        if (!bdb_start_top_level_commissioning(ZB_BDB_INITIALIZATION)) {
+            ESP_LOGE(TAG, "continue_zboss: BDB initialization did not start");
+            cmd_handle<NWK_START_WITHOUT_FORMATION>::response(1);
+        }
     }
 }
 
@@ -893,6 +908,18 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
     memcpy(&nwk_addr, p + 2, 2);
     const uint8_t  declared_sd = p[4];
 
+    // Number of bytes we can actually read for the simple_desc body. Trust the
+    // smaller of (frame remainder) and (declared length) — the whole point of
+    // the intercept is to tolerate frame-length > declared. We also accept
+    // frame-length < declared (truncate to what we have) since some devices
+    // are buggy in the other direction too.
+    uint16_t avail = (len > 5) ? (len - 5) : 0;
+    if (declared_sd < avail) avail = declared_sd;
+    // A success body holds at least the 8 fixed bytes (both counts). A
+    // shorter one is not claimed: answering it would invent an empty
+    // descriptor. The stack's own parser then handles the frame.
+    if (status == 0 && avail < 8) return false;
+
     using Resolver = request_cmd_resolver<ZDO_SIMPLE_DESC_REQ, zb_zdo_simple_desc_req_t>;
     // DISP-2: claim+free the slot atomically up front. We then build and send the
     // synthesised response (a blocking send_cmd_data) on the local copy, so the
@@ -908,14 +935,6 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
         return false;
     }
     protocol::reply_scope scope(req.epoch);
-
-    // Number of bytes we can actually read for the simple_desc body. Trust the
-    // smaller of (frame remainder) and (declared length) — the whole point of
-    // the intercept is to tolerate frame-length > declared. We also accept
-    // frame-length < declared (truncate to what we have) since some devices
-    // are buggy in the other direction too.
-    uint16_t avail = (len > 5) ? (len - 5) : 0;
-    if (declared_sd < avail) avail = declared_sd;
 
     // Build the response wire format directly. Layout (per format_response):
     //   cmd_t (4) | CATEGORY_ZDO (1) | status (1) | endpoint (1)
@@ -933,7 +952,7 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
     *out++ = STATUS_CATEGORY_ZDO;
     *out++ = status;
 
-    if (status == 0 && avail >= 7) {
+    if (status == 0) {
         // Wire-format layout (ZCL Foundation 2.4.4.1.5 Simple_Desc_rsp body):
         //   sd[0]            endpoint
         //   sd[1..2]         profile_id  (little-endian)
@@ -960,6 +979,9 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
             in_count = bytes_after_in_count / 2;
         }
 
+        // The output list sits after the whole input list on the wire,
+        // however many input clusters the cap below keeps.
+        const uint8_t wire_in_count = in_count;
         // out_count is at offset 7 + 2*in_count (after the input list).
         const uint16_t out_count_off = 7u + 2u * uint16_t(in_count);
         uint8_t  out_count = 0;
@@ -990,7 +1012,7 @@ bool zb_ncp::try_intercept_simple_desc_rsp(const uint8_t* p, uint16_t len) {
         // Output cluster list starts at sd[8 + 2*in_count] (one byte past the
         // input list, accounting for the out_count byte itself).
         for (uint8_t i = 0; i < out_count; ++i) {
-            memcpy(out, sd + 8 + 2u * uint16_t(in_count) + 2u * i, 2); out += 2;
+            memcpy(out, sd + 8 + 2u * uint16_t(wire_in_count) + 2u * i, 2); out += 2;
         }
     }
     // Tail: nwk_addr is present regardless of status (format_response writes it

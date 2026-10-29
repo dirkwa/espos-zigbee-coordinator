@@ -46,6 +46,8 @@ private:
 	uint32_t m_channels_mask;
 	static void continue_zboss(uint8_t );
 	static void set_channel_mask(uint32_t mask);
+	// What a host may set: channels 11-26 only, at least one.
+	static bool channel_mask_valid(uint32_t mask);
 	static void ncp_zb_task(void* arg);
 
 private:
@@ -62,7 +64,10 @@ public:
 	// at startup, it queries GET_JOINED / GET_PAN_ID first and on the stale
 	// 0xFFFF/0xFF defaults decides to formNetwork() and wipes paired devices.
 	// See andryblack/esp-coordinator#5 / #19, z2m #26152. Idempotent.
-	static bool start_zigbee_stack();
+	// STARTED: the task is new and continue_zboss will run. RUNNING: it
+	// was already up. FAILED: no task, so nothing will answer.
+	enum class stack_start_t { STARTED, RUNNING, FAILED };
+	static stack_start_t start_zigbee_stack();
 	// The synthetic boot-ready NCP_RESET response (tsn=0xFF). Normally sent
 	// from continue_zboss once the NVRAM dataset is loaded; in boot-guard
 	// safe mode app::start_int sends it instead (ZBOSS never starts there),

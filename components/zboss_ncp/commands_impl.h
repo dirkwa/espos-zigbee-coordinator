@@ -285,6 +285,8 @@ struct zb_ncp::cmd_handle<SET_ZIGBEE_CHANNEL_MASK> : immediate_cmd_process<SET_Z
 	static void process_status_arg(ncp_generic_status_t& status, const SET_ZIGBEE_CHANNEL_MASK_arg_t& arg) {
 		if (arg.page != 0) {
 			status = GENERIC_INVALID_PARAMETER_1;
+		} else if (!zb_ncp::channel_mask_valid(arg.mask)) {
+			status = GENERIC_INVALID_PARAMETER_2;
 		} else {
 			zb_ncp::set_channel_mask(arg.mask);
 		}
@@ -825,6 +827,8 @@ struct zb_ncp::cmd_handle<NWK_FORMATION> : delayed_cmd_process<NWK_FORMATION,sin
                 return GENERIC_INVALID_PARAMETER;
             uint32_t channel_mask; memcpy(&channel_mask, indata, 4);
             indata+=4; cmdlen-=4;
+            if (!zb_ncp::channel_mask_valid(channel_mask))
+                return GENERIC_INVALID_PARAMETER;
             ESP_LOGD(TAG,"zb_set_channel_mask: %08lx",channel_mask);
             zb_ncp::set_channel_mask(channel_mask);
         }
@@ -854,11 +858,16 @@ struct zb_ncp::cmd_handle<NWK_FORMATION> : delayed_cmd_process<NWK_FORMATION,sin
             int(ext_pan_id[0]),int(ext_pan_id[1]),int(ext_pan_id[2]),int(ext_pan_id[3]),int(ext_pan_id[4]),int(ext_pan_id[5]),int(ext_pan_id[6]),int(ext_pan_id[7]));
         
 
-        if (!zb_ncp::start_zigbee_stack()) {
-
-            if (!bdb_start_top_level_commissioning(ZB_BDB_NETWORK_FORMATION)) {
+        switch (zb_ncp::start_zigbee_stack()) {
+            case zb_ncp::stack_start_t::STARTED:
+                break;
+            case zb_ncp::stack_start_t::RUNNING:
+                if (!bdb_start_top_level_commissioning(ZB_BDB_NETWORK_FORMATION)) {
+                    return GENERIC_ERROR;
+                }
+                break;
+            case zb_ncp::stack_start_t::FAILED:
                 return GENERIC_ERROR;
-            }
         }
         return 0;
     }
@@ -923,8 +932,14 @@ struct zb_ncp::cmd_handle<NWK_START_WITHOUT_FORMATION> : delayed_cmd_process<NWK
     static constexpr const char* name = "NWK_START_WITHOUT_FORMATION";
     //static uint32_t channel_mask;
     static int start_delayed(const void* cmddata,uint16_t cmdlen) {
-        if (!zb_ncp::start_zigbee_stack()) {
-            response(0);
+        switch (zb_ncp::start_zigbee_stack()) {
+            case zb_ncp::stack_start_t::STARTED:
+                break;
+            case zb_ncp::stack_start_t::RUNNING:
+                response(0);
+                break;
+            case zb_ncp::stack_start_t::FAILED:
+                return GENERIC_ERROR;
         }
         return 0;
     }
@@ -2877,6 +2892,10 @@ struct zb_ncp::cmd_handle<RESTORE_STRUCTURED_BACKUP> : immediate_cmd_process<RES
         if ((size_t)sizeof(hdr) + hdr.payload_len > inlen) {
             ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: declared %u + hdr > inlen %u",
                      hdr.payload_len, (unsigned)inlen);
+            return reply(outdata, GENERIC_INVALID_PARAMETER);
+        }
+        if (!backup_structured::image_valid(in, inlen)) {
+            ESP_LOGE(TAG, "RESTORE_STRUCTURED_BACKUP: malformed or incomplete TLV image");
             return reply(outdata, GENERIC_INVALID_PARAMETER);
         }
 
