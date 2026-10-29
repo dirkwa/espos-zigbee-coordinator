@@ -4,3 +4,44 @@
 # The flash size of partitions/16mb.csv, which CMakeLists.txt picks for this
 # chip; a bundled espOS table would set it itself.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# The C5 has too little internal RAM for espOS, the Zigbee stack and the
+# NCP's host buffers together. On a Waveshare ESP32-C5-WIFI6-KIT-N16R8 about
+# 92 KB of internal RAM is left once espOS runs, ZB_INIT takes 34 KB of it,
+# and the second 20 KB transport buffer then fails with ESP_ERR_NO_MEM, so the
+# coordinator never starts. Every C5 module espOS has seen carries 8 MB of
+# PSRAM; the lines below are espOS's recipe for this chip
+# (espos/docs/hardware.md, the ble_gateway example's C5 defaults) without the
+# Bluetooth ones. CONFIG_SPIRAM is not a bootloader option on the C5, so it
+# ships by OTA. A board without PSRAM still boots, with the shortage above.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# malloc() keeps every request under 16 KB internal by default, which covers
+# nearly all of espOS. With 256, everything larger than 256 bytes goes to
+# PSRAM first; whatever needs DMA or internal RAM asks with caps, and the
+# reserve keeps a pool for it.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# TLS record buffers (OTA downloads, the Signal K client) from PSRAM.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# NOT CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: with it the station never
+# associates on this part (espos/docs/hardware.md).
+
+# The WiFi driver's static RX buffers are internal by necessity; 6, equal to
+# the block-ack window, is plenty for a link that carries ZBOSS frames.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+
+# WiFi library code back to flash: on the C5 code and data share one SRAM,
+# so IRAM the driver claims for throughput is heap the coordinator lacks.
+# Interrupt handlers stay in IRAM either way.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=n
+CONFIG_ESP_WIFI_SLP_IRAM_OPT=n
+
+# mDNS's task stack and allocations: neither touches flash.
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
