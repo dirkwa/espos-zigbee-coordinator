@@ -12,7 +12,6 @@
  * Zigbee2MQTT finds it with `serial.port: mdns://espos-zigbee`, or takes
  * `tcp://<device>:6638` directly, with `serial.adapter: zboss`.
  */
-#include "esp_coexist.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "espos.h"
@@ -28,16 +27,6 @@ const char* TAG = "zigbee_coordinator";
 
 extern "C" void app_main(void) {
   ESP_ERROR_CHECK(espos_start(nullptr));
-
-#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
-  /* Workaround for signalk-espOS/espOS#274, goes with the bump to the espOS
-   * release that carries it: espOS 0.25 starts Wi-Fi without telling the
-   * coexistence arbiter about 802.15.4, and the coordinator's receiver, which
-   * is always on, then keeps the radio until the AP drops the station. */
-  if (esp_err_t coex = esp_coex_wifi_i154_enable(); coex != ESP_OK) {
-    ESP_LOGW(TAG, "802.15.4 coexistence not enabled: %s", esp_err_to_name(coex));
-  }
-#endif
 
   esp_err_t err = zboss_ncp_start();
   if (err != ESP_OK) {
