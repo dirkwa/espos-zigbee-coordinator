@@ -331,15 +331,80 @@ jobs:
             echo "  https://raw.githubusercontent.com/${REPO}/release-assets/${TAG}/$(basename "$f")"
           done
 
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          # Named explicitly: on a workflow_call there is no release event.
-          tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+      # Upload only, through `gh release upload`. softprops/action-gh-release
+      # also rewrites the release (name, body, tag) on every run, and that
+      # update-a-release call answers 403 "Resource not accessible by
+      # integration" to this job's token here although the job holds
+      # contents: write (v0.1.0, 2026-10-29). Attaching assets needs no such
+      # rewrite, and the release itself is release-please's to word.
+      - name: attach the images to the release
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           # Fail rather than publish a release missing a chip's firmware: a
           # silently incomplete release is worse than a failed one, because the
           # registry would index it and offer owners of that chip nothing.
-          fail_on_unmatched_files: true
-          files: dist/*.bin
+          shopt -s nullglob
+          files=(dist/*.bin)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no images in dist/ to attach to $TAG"
+            exit 1
+          fi
+
+          # --clobber deletes an existing asset before uploading its
+          # replacement, and gh cancels the remaining uploads when one fails,
+          # so a failed re-run can leave the release missing images it had.
+          # Keep a copy of what is attached now; the restore step below puts
+          # it back, as the mirror rollback does for the branch.
+          backup="${RUNNER_TEMP}/release-before"
+          mkdir -p "$backup"
+          mapfile -t attached < <(
+            gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name'
+          )
+          if [ "${#attached[@]}" -gt 0 ]; then
+            gh release download "$TAG" -R "$REPO" -D "$backup"
+          fi
+          touch "${RUNNER_TEMP}/release-upload-started"
+
+          gh release upload "$TAG" "${files[@]}" --clobber -R "$REPO"
+
+      # Put the release's assets back to what they were before this run, so
+      # the release and the rolled-back mirror below agree. Only once the
+      # upload has started: before that, this run has not touched the release.
+      - name: restore the release's images if anything failed
+        if: failure()
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          backup="${RUNNER_TEMP}/release-before"
+          if [ ! -f "${RUNNER_TEMP}/release-upload-started" ]; then
+            echo "the release was not touched; nothing to restore"
+            exit 0
+          fi
+
+          # Assets this run added that the release did not have before.
+          mapfile -t now < <(
+            gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name'
+          )
+          for name in "${now[@]}"; do
+            if [ ! -e "$backup/$name" ]; then
+              gh release delete-asset "$TAG" "$name" -R "$REPO" --yes \
+                || echo "::warning::could not delete $name from $TAG"
+            fi
+          done
+
+          shopt -s nullglob
+          before=("$backup"/*)
+          if [ "${#before[@]}" -gt 0 ]; then
+            gh release upload "$TAG" "${before[@]}" --clobber -R "$REPO"
+          fi
+          echo "$TAG restored to the ${#before[@]} image(s) it had before this run"
 
       # If attaching the assets fails after the mirror has published, the
       # branch advertises images for a release that has none. Roll the mirror
