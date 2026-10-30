@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 (2026-10-30)
+
+<!-- Release notes generated using configuration in .github/release.yml at main -->
+
+## What's Changed
+### Fixed
+* fix: bump espOS to v0.25.2 by @dirkwa in https://github.com/dirkwa/espos-zigbee-coordinator/pull/10
+
+
+**Full Changelog**: https://github.com/dirkwa/espos-zigbee-coordinator/compare/v0.2.0...v0.2.1
+
 ## 0.2.0 (2026-10-29)
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
